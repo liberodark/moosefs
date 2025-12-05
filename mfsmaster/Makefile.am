@@ -32,6 +32,8 @@ mfsmaster_SOURCES = \
 	flocklocks.c flocklocks.h \
 	posixlocks.c posixlocks.h \
 	openfiles.c openfiles.h \
+	hamanager.c hamanager.h \
+	ha_integration.c ha_integration.h \
 	csdb.c csdb.h \
 	iptosesid.c iptosesid.h \
 	storageclass.c storageclass.h \

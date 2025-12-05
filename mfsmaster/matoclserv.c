@@ -1,17 +1,17 @@
 /*
  * Copyright (C) 2025 Jakub Kruszona-Zawadzki, Saglabs SA
- * 
+ *
  * This file is part of MooseFS.
- * 
+ *
  * MooseFS is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, version 2 (only).
- * 
+ *
  * MooseFS is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with MooseFS; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02111-1301, USA
@@ -74,6 +74,7 @@
 #include "iptosesid.h"
 #include "mfsalloc.h"
 #include "multilan.h"
+#include "ha_integration.h"
 
 #define MaxPacketSize CLTOMA_MAXPACKETSIZE
 
@@ -281,6 +282,13 @@ static inline int matoclserv_fuse_write_chunk_common(matoclserventry *eptr,uint3
 	uint8_t split;
 	uint8_t count;
 	uint8_t cs_data[100*14];
+
+	if (!ha_can_accept_write()) {
+		ptr = matoclserv_create_packet(eptr, MATOCL_FUSE_WRITE_CHUNK, 5);
+		put32bit(&ptr, msgid);
+		put8bit(&ptr, MFS_ERROR_NOTLEADER);
+		return 0;
+	}
 
 	if (sessions_get_disables(eptr->sesdata)&DISABLE_WRITE) {
 		status = MFS_ERROR_EPERM;

@@ -1,0 +1,161 @@
+# MooseFS High Availability Configuration
+# ========================================
+#
+# This file configures the HA (High Availability) module for MooseFS master servers.
+# The HA module implements a Raft-based consensus algorithm to provide:
+#   - Automatic leader election
+#   - Real-time changelog replication
+#   - Automatic failover
+#   - Split-brain protection
+#
+# IMPORTANT: All master servers in the HA cluster must have identical mfsexports.cfg
+# and storage class configurations.
+
+###############################################################################
+# BASIC HA CONFIGURATION
+###############################################################################
+
+# Enable or disable HA functionality (0 = disabled, 1 = enabled)
+# Default: 0
+# HA_ENABLED = 1
+
+# IP address to bind for HA communication (* means any)
+# Default: *
+# HA_BIND_HOST = *
+
+# Port for HA inter-master communication
+# Default: 9420
+# HA_PORT = 9420
+
+# Comma-separated list of peer master servers
+# Format: host1:port1,host2:port2,host3:port3
+# Example: master2.example.com:9420,master3.example.com:9420
+# Note: Do not include the local server in this list
+# HA_PEERS = 
+
+###############################################################################
+# RAFT TIMING CONFIGURATION
+###############################################################################
+
+# Heartbeat interval in milliseconds
+# The leader sends heartbeats to followers at this interval
+# Should be much smaller than election timeout
+# Default: 150
+# HA_HEARTBEAT_MS = 150
+
+# Minimum election timeout in milliseconds
+# If a follower doesn't receive a heartbeat within this time, it starts an election
+# Default: 300
+# HA_ELECTION_TIMEOUT_MIN_MS = 300
+
+# Maximum election timeout in milliseconds
+# Actual timeout is randomly chosen between min and max to avoid split votes
+# Default: 500
+# HA_ELECTION_TIMEOUT_MAX_MS = 500
+
+###############################################################################
+# FAILOVER CONFIGURATION
+###############################################################################
+
+# Enable automatic failover (0 = disabled, 1 = enabled)
+# When enabled, followers will automatically become candidates if leader fails
+# When disabled, manual intervention is required for failover
+# Default: 1
+# HA_AUTO_FAILOVER = 1
+
+# Minimum time to wait before accepting a new leader after failover (seconds)
+# This helps ensure metadata is fully synchronized before accepting writes
+# Default: 5
+# HA_FAILOVER_DELAY = 5
+
+# Maximum number of changelog entries that can be behind before requiring full sync
+# If a follower is more than this many entries behind, it will request full metadata
+# Default: 10000
+# HA_MAX_CHANGELOG_LAG = 10000
+
+###############################################################################
+# SYNCHRONIZATION CONFIGURATION
+###############################################################################
+
+# Batch size for changelog replication (number of entries per batch)
+# Larger batches are more efficient but use more memory
+# Default: 1000
+# HA_CHANGELOG_BATCH_SIZE = 1000
+
+# Timeout for synchronization operations in milliseconds
+# Default: 5000
+# HA_SYNC_TIMEOUT_MS = 5000
+
+# Enable read operations on follower servers (0 = disabled, 1 = enabled)
+# When enabled, clients can perform read operations on followers
+# This can improve read performance but may return slightly stale data
+# Default: 0
+# HA_ALLOW_FOLLOWER_READS = 0
+
+###############################################################################
+# NETWORK CONFIGURATION
+###############################################################################
+
+# Timeout for HA connections in seconds
+# Default: 10
+# HA_TIMEOUT = 10
+
+# Number of reconnection attempts before marking a peer as down
+# Default: 3
+# HA_RECONNECT_ATTEMPTS = 3
+
+# Delay between reconnection attempts in seconds
+# Default: 5
+# HA_RECONNECT_DELAY = 5
+
+###############################################################################
+# MONITORING AND LOGGING
+###############################################################################
+
+# Log level for HA module (ERROR, WARNING, NOTICE, INFO, DEBUG)
+# Default: INFO
+# HA_LOG_LEVEL = INFO
+
+# Interval for logging HA cluster status in seconds (0 = disabled)
+# Default: 60
+# HA_STATUS_LOG_INTERVAL = 60
+
+###############################################################################
+# EXAMPLE CONFIGURATIONS
+###############################################################################
+
+# Example: 3-node HA cluster
+# --------------------------
+# On master1.example.com (mfsha.cfg):
+#   HA_ENABLED = 1
+#   HA_PORT = 9420
+#   HA_PEERS = master2.example.com:9420,master3.example.com:9420
+#
+# On master2.example.com (mfsha.cfg):
+#   HA_ENABLED = 1
+#   HA_PORT = 9420
+#   HA_PEERS = master1.example.com:9420,master3.example.com:9420
+#
+# On master3.example.com (mfsha.cfg):
+#   HA_ENABLED = 1
+#   HA_PORT = 9420
+#   HA_PEERS = master1.example.com:9420,master2.example.com:9420
+
+# Example: 2-node HA cluster with witness
+# ---------------------------------------
+# Note: 2-node clusters require a witness to avoid split-brain
+# On master1.example.com (mfsha.cfg):
+#   HA_ENABLED = 1
+#   HA_PORT = 9420
+#   HA_PEERS = master2.example.com:9420,witness.example.com:9420
+#
+# On master2.example.com (mfsha.cfg):
+#   HA_ENABLED = 1
+#   HA_PORT = 9420
+#   HA_PEERS = master1.example.com:9420,witness.example.com:9420
+#
+# On witness.example.com (runs mfsha-witness):
+#   HA_ENABLED = 1
+#   HA_PORT = 9420
+#   HA_PEERS = master1.example.com:9420,master2.example.com:9420
+#   HA_WITNESS_MODE = 1

@@ -1,17 +1,17 @@
 /*
  * Copyright (C) 2025 Jakub Kruszona-Zawadzki, Saglabs SA
- * 
+ *
  * This file is part of MooseFS.
- * 
+ *
  * MooseFS is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, version 2 (only).
- * 
+ *
  * MooseFS is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with MooseFS; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02111-1301, USA
@@ -38,6 +38,7 @@
 #include "globengine.h"
 #include "bgsaver.h"
 #include "multilan.h"
+#include "hamanager.h"
 
 #define MODULE_OPTIONS_GETOPT "iax"
 #define MODULE_OPTIONS_SWITCH \
@@ -63,6 +64,7 @@ struct {
 	{bgsaver_init,"bgsaver"},
 	{glob_cache_init,"glob engine"},
 	{multilan_init,"multilan map"},
+	{ha_init,"high availability manager"},
 	{changelog_init,"change log"},
 	{missing_log_init,"missing chunks/files log"}, // has to be before 'fs_init'
 	{dcm_init,"data cache manager"}, // has to be before 'fs_init' and 'matoclserv_init'
