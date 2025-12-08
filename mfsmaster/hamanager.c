@@ -779,7 +779,21 @@ int ha_init(void) {
     /* Get our own IP for self identification */
     cluster->self_port = HA_Port;
     tcpgetmyaddr(ha_lsock, &cluster->self_ip, NULL);
-    cluster->self_id = ha_generate_peer_id(cluster->self_ip, HA_Port);
+    
+    /* Determine self_id - priority: HA_NODE_ID > MATOCS_LISTEN_HOST > auto-detect */
+    cluster->self_id = cfg_getuint32("HA_NODE_ID", 0);
+    if (cluster->self_id == 0) {
+        /* Try to get IP from MATOCS_LISTEN_HOST */
+        char *matocs_host = cfg_getstr("MATOCS_LISTEN_HOST", NULL);
+        if (matocs_host != NULL && matocs_host[0] != '*' && matocs_host[0] != '\0') {
+            uint32_t matocs_ip;
+            if (tcpresolve(matocs_host, NULL, &matocs_ip, NULL, 1) >= 0) {
+                cluster->self_ip = matocs_ip;
+            }
+            free(matocs_host);
+        }
+        cluster->self_id = ha_generate_peer_id(cluster->self_ip, HA_Port);
+    }
     
     mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_INFO, 
             "HA: Initialized, listening on %s:%u, self_id=%u",
