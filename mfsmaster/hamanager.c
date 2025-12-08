@@ -798,12 +798,18 @@ int ha_init(void) {
     cluster->peer_count = 0;
     cluster->quorum_size = 1;
     cluster->votes_received = 0;
-    cluster->heartbeat_interval_ms = HA_HEARTBEAT_MS;
-    cluster->election_timeout_min_ms = HA_ELECTION_TIMEOUT_MIN;
-    cluster->election_timeout_max_ms = HA_ELECTION_TIMEOUT_MAX;
+    cluster->heartbeat_interval_ms = cfg_getuint32("HA_HEARTBEAT_MS", HA_HEARTBEAT_MS);
+    cluster->election_timeout_min_ms = cfg_getuint32("HA_ELECTION_TIMEOUT_MIN_MS", HA_ELECTION_TIMEOUT_MIN);
+    cluster->election_timeout_max_ms = cfg_getuint32("HA_ELECTION_TIMEOUT_MAX_MS", HA_ELECTION_TIMEOUT_MAX);
     cluster->election_timeout = ha_random_timeout();  /* Must be after timeout_min/max init */
     cluster->enable_auto_failover = 1;
     cluster->last_heartbeat_received = monotonic_seconds();
+    
+    mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_INFO, 
+            "HA: Timeouts configured: heartbeat=%ums, election=%u-%ums",
+            cluster->heartbeat_interval_ms, 
+            cluster->election_timeout_min_ms, 
+            cluster->election_timeout_max_ms);
     
     /* Create listening socket */
     ha_lsock = tcpsocket();
