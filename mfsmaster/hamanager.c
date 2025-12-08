@@ -116,6 +116,9 @@ const char* ha_state_str(ha_state_t state) {
 
 static int ha_connect_peer(ha_peer_t *peer) {
     int sock;
+    struct pollfd pfd;
+    int err;
+    socklen_t errlen = sizeof(err);
     
     if (peer->is_connected && peer->sock >= 0) {
         return 0;
@@ -131,6 +134,22 @@ static int ha_connect_peer(ha_peer_t *peer) {
     
     if (tcpnumconnect(sock, peer->ip, peer->port) < 0) {
         if (errno != EINPROGRESS) {
+            tcpclose(sock);
+            return -1;
+        }
+        
+        /* Wait for connection to complete (max 1 second) */
+        pfd.fd = sock;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        
+        if (poll(&pfd, 1, 1000) <= 0) {
+            tcpclose(sock);
+            return -1;
+        }
+        
+        /* Check if connection succeeded */
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0) {
             tcpclose(sock);
             return -1;
         }
