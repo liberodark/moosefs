@@ -297,7 +297,9 @@ static void ha_become_candidate(void) {
             "HA: Starting election for term %lu", cluster->current_term);
     
     /* Request votes from all peers */
-    ha_broadcast_message(HA_MSG_REQUEST_VOTE, payload, sizeof(payload));
+    int sent = ha_broadcast_message(HA_MSG_REQUEST_VOTE, payload, sizeof(payload));
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE, 
+            "HA: Sent REQUEST_VOTE to %d peers", sent);
 }
 
 static void ha_become_leader(void) {
@@ -374,7 +376,12 @@ static void ha_handle_request_vote(ha_peer_t *peer, const uint8_t *data, uint32_
     uint32_t candidate_id;
     uint8_t vote_granted = 0;
     
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE, 
+            "HA: Received REQUEST_VOTE from peer %u, len=%u", peer->id, len);
+    
     if (len < sizeof(ha_request_vote_t)) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
+                "HA: REQUEST_VOTE too short: %u < %zu", len, sizeof(ha_request_vote_t));
         return;
     }
     
@@ -645,9 +652,14 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
     /* Validate header */
     if (header.magic != HA_MSG_MAGIC) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
-                "HA: Invalid magic number from peer %u", peer->id);
+                "HA: Invalid magic number 0x%08X from peer %u (expected 0x%08X)", 
+                header.magic, peer->id, HA_MSG_MAGIC);
         return;
     }
+    
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE, 
+            "HA: Received message type=%u from peer %u, term=%lu, len=%u",
+            header.type, peer->id, header.term, header.length);
     
     if (header.version != HA_PROTOCOL_VER) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
@@ -1086,11 +1098,14 @@ void ha_set_sync_complete_callback(ha_on_sync_complete_fn fn) {
  * Network Event Handlers (for main event loop)
  * ============================================================================ */
 
+static int ha_lsock_pdescpos = -1;
+
 void ha_desc(struct pollfd *pdesc, uint32_t *ndesc) {
     uint32_t pos = *ndesc;
     uint32_t i;
     
     if (!HA_Enabled || cluster == NULL) {
+        ha_lsock_pdescpos = -1;
         return;
     }
     
@@ -1098,12 +1113,15 @@ void ha_desc(struct pollfd *pdesc, uint32_t *ndesc) {
     if (ha_lsock >= 0) {
         pdesc[pos].fd = ha_lsock;
         pdesc[pos].events = POLLIN;
+        ha_lsock_pdescpos = pos;
         pos++;
+    } else {
+        ha_lsock_pdescpos = -1;
     }
     
     /* Add peer sockets */
     for (i = 0; i < cluster->peer_count; i++) {
-        if (cluster->peers[i].sock >= 0) {
+        if (cluster->peers[i].sock >= 0 && cluster->peers[i].is_connected) {
             pdesc[pos].fd = cluster->peers[i].sock;
             pdesc[pos].events = POLLIN;
             cluster->peers[i].pdescpos = pos;
@@ -1127,7 +1145,7 @@ void ha_serve(struct pollfd *pdesc) {
     }
     
     /* Check listening socket for new connections */
-    if (ha_lsock >= 0 && (pdesc[0].revents & POLLIN)) {
+    if (ha_lsock >= 0 && ha_lsock_pdescpos >= 0 && (pdesc[ha_lsock_pdescpos].revents & POLLIN)) {
         ns = tcpaccept(ha_lsock);
         if (ns >= 0) {
             tcpnonblock(ns);
@@ -1150,12 +1168,16 @@ void ha_serve(struct pollfd *pdesc) {
                     }
                     cluster->peers[i].sock = ns;
                     cluster->peers[i].is_connected = 1;
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO, 
+                            "HA: Accepted connection from peer %u", cluster->peers[i].id);
                     break;
                 }
             }
             
             if (i >= cluster->peer_count) {
                 /* Unknown peer, close connection */
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
+                        "HA: Unknown peer IP, closing connection");
                 tcpclose(ns);
             }
         }
@@ -1169,6 +1191,8 @@ void ha_serve(struct pollfd *pdesc) {
             
             received = read(cluster->peers[i].sock, buffer, sizeof(buffer));
             if (received > 0) {
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG, 
+                        "HA: Received %zd bytes from peer %u", received, cluster->peers[i].id);
                 ha_handle_message(&cluster->peers[i], buffer, received);
             } else if (received == 0) {
                 /* Connection closed */
