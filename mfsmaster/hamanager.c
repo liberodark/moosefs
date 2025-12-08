@@ -76,7 +76,12 @@ static void ha_send_heartbeats(void);
 
 static double ha_random_timeout(void) {
     uint32_t range = cluster->election_timeout_max_ms - cluster->election_timeout_min_ms;
-    uint32_t random_ms = cluster->election_timeout_min_ms + (rand() % range);
+    uint32_t random_ms;
+    if (range == 0) {
+        random_ms = cluster->election_timeout_min_ms;
+    } else {
+        random_ms = cluster->election_timeout_min_ms + (rand() % range);
+    }
     return (double)random_ms / 1000.0;
 }
 
@@ -737,10 +742,10 @@ int ha_init(void) {
     cluster->peer_count = 0;
     cluster->quorum_size = 1;
     cluster->votes_received = 0;
-    cluster->election_timeout = ha_random_timeout();
     cluster->heartbeat_interval_ms = HA_HEARTBEAT_MS;
     cluster->election_timeout_min_ms = HA_ELECTION_TIMEOUT_MIN;
     cluster->election_timeout_max_ms = HA_ELECTION_TIMEOUT_MAX;
+    cluster->election_timeout = ha_random_timeout();  /* Must be after timeout_min/max init */
     cluster->enable_auto_failover = 1;
     cluster->last_heartbeat_received = monotonic_seconds();
     
