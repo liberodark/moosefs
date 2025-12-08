@@ -682,6 +682,19 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
 static void ha_check_election_timeout(void) {
     double now = monotonic_seconds();
     double elapsed;
+    static int log_counter = 0;
+    
+    if (cluster == NULL || !HA_Enabled) {
+        return;
+    }
+    
+    /* Log every 10 calls (~10 seconds) to confirm function is being called */
+    if (++log_counter >= 10) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE, 
+                "HA: check_timeout: state=%d, elapsed=%.2fs, timeout=%.2fs",
+                cluster->state, now - cluster->last_heartbeat_received, cluster->election_timeout);
+        log_counter = 0;
+    }
     
     if (cluster->state == HA_STATE_LEADER) {
         /* Leader: send periodic heartbeats */
@@ -694,11 +707,15 @@ static void ha_check_election_timeout(void) {
         /* Follower/Candidate: check for election timeout */
         elapsed = now - cluster->last_heartbeat_received;
         if (elapsed >= cluster->election_timeout) {
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO, 
-                    "HA: Election timeout (%.2fs elapsed), starting election",
-                    elapsed);
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE, 
+                    "HA: Election timeout (%.2fs elapsed, timeout=%.2fs), starting election",
+                    elapsed, cluster->election_timeout);
             ha_become_candidate();
         }
+    } else {
+        /* Log unexpected state */
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG, 
+                "HA: check_election_timeout called in state %d", cluster->state);
     }
 }
 
@@ -807,11 +824,18 @@ int ha_init(void) {
     /* Start as follower */
     cluster->state = HA_STATE_FOLLOWER;
     
+    mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_NOTICE, 
+            "HA: Starting as FOLLOWER, election_timeout=%.3fs", 
+            cluster->election_timeout);
+    
     /* Register with main event loop */
     main_poll_register(ha_desc, ha_serve);
-    main_time_register(0, 100000, ha_check_election_timeout);  /* 100ms */
+    main_time_register(1, 0, ha_check_election_timeout);  /* Every 1 second */
     main_reload_register(ha_reload);
     main_destruct_register(ha_term);
+    
+    mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_NOTICE, 
+            "HA: Registered with main loop, will check timeout every 1s");
     
     return 0;
 }
