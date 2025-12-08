@@ -1,10 +1,10 @@
 /*
  * MooseFS Community Edition - High Availability Module
- * 
+ *
  * Copyright (C) 2025 - Open Source Community Contribution
- * 
+ *
  * This file is part of MooseFS.
- * 
+ *
  * MooseFS is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, version 2 (only).
@@ -19,7 +19,7 @@
 
 /*
  * MooseFS HA Manager
- * 
+ *
  * Implements a Raft-based consensus algorithm for master server
  * high availability. Supports automatic leader election and
  * failover with real-time changelog synchronization.
@@ -32,8 +32,8 @@
 #define HA_MAX_PEERS            16          /* Maximum number of masters in cluster */
 #define HA_DEFAULT_PORT         9420        /* Default HA communication port */
 #define HA_HEARTBEAT_MS         150         /* Heartbeat interval in milliseconds */
-#define HA_ELECTION_TIMEOUT_MIN 300         /* Minimum election timeout (ms) */
-#define HA_ELECTION_TIMEOUT_MAX 500         /* Maximum election timeout (ms) */
+#define HA_ELECTION_TIMEOUT_MIN 1500        /* Minimum election timeout (ms) */
+#define HA_ELECTION_TIMEOUT_MAX 3000        /* Maximum election timeout (ms) */
 #define HA_CHANGELOG_BATCH_SIZE 1000        /* Max changelog entries per sync */
 #define HA_SYNC_TIMEOUT_MS      5000        /* Sync timeout in milliseconds */
 
@@ -60,20 +60,20 @@ typedef enum {
     HA_MSG_VOTE_RESPONSE        = 0x0002,   /* Response to vote request */
     HA_MSG_APPEND_ENTRIES       = 0x0003,   /* Heartbeat / log replication */
     HA_MSG_APPEND_RESPONSE      = 0x0004,   /* Response to append entries */
-    
+
     /* Cluster management */
     HA_MSG_JOIN_REQUEST         = 0x0010,   /* Request to join cluster */
     HA_MSG_JOIN_RESPONSE        = 0x0011,   /* Response to join request */
     HA_MSG_LEAVE_NOTIFY         = 0x0012,   /* Graceful leave notification */
     HA_MSG_CLUSTER_CONFIG       = 0x0013,   /* Cluster configuration update */
-    
+
     /* Metadata synchronization */
     HA_MSG_SYNC_REQUEST         = 0x0020,   /* Request metadata snapshot */
     HA_MSG_SYNC_RESPONSE        = 0x0021,   /* Metadata snapshot data */
     HA_MSG_CHANGELOG_ENTRY      = 0x0022,   /* Single changelog entry */
     HA_MSG_CHANGELOG_BATCH      = 0x0023,   /* Batch of changelog entries */
     HA_MSG_CHANGELOG_ACK        = 0x0024,   /* Acknowledge changelog receipt */
-    
+
     /* Health and monitoring */
     HA_MSG_PING                 = 0x0030,   /* Simple ping */
     HA_MSG_PONG                 = 0x0031,   /* Ping response */
@@ -122,42 +122,42 @@ typedef struct ha_cluster {
     uint32_t    self_id;                    /* Our peer ID */
     uint32_t    self_ip;                    /* Our IP address */
     uint16_t    self_port;                  /* Our HA port */
-    
+
     /* Raft state */
     ha_state_t  state;                      /* Current state */
     uint64_t    current_term;               /* Current term number */
     uint32_t    voted_for;                  /* Candidate voted for this term */
     uint32_t    leader_id;                  /* Current leader ID */
-    
+
     /* Log state */
     uint64_t    commit_index;               /* Highest committed entry */
     uint64_t    last_applied;               /* Last applied to state machine */
     uint64_t    last_log_index;             /* Last log entry index */
     uint64_t    last_log_term;              /* Term of last log entry */
-    
+
     /* Cluster membership */
     ha_peer_t   peers[HA_MAX_PEERS];        /* Peer list */
     uint32_t    peer_count;                 /* Number of peers */
     uint32_t    quorum_size;                /* Required quorum size */
-    
+
     /* Election */
     uint32_t    votes_received;             /* Votes received this election */
     double      election_timeout;           /* Current election timeout */
     double      election_start;             /* Election start time */
     double      last_heartbeat_sent;        /* Last heartbeat sent (leader) */
     double      last_heartbeat_received;    /* Last heartbeat from leader */
-    
+
     /* Synchronization */
     uint64_t    sync_target_version;        /* Target metadata version */
     uint8_t     sync_in_progress;           /* Sync operation in progress */
-    
+
     /* Statistics */
     uint64_t    elections_started;          /* Number of elections started */
     uint64_t    elections_won;              /* Number of elections won */
     uint64_t    terms_seen;                 /* Number of terms observed */
     uint64_t    changelogs_replicated;      /* Changelogs replicated */
     uint64_t    failovers;                  /* Number of failovers */
-    
+
     /* Configuration */
     uint32_t    heartbeat_interval_ms;      /* Heartbeat interval */
     uint32_t    election_timeout_min_ms;    /* Min election timeout */
@@ -245,6 +245,7 @@ uint64_t ha_get_commit_index(void);
 
 /* Synchronization */
 int ha_request_full_sync(void);
+int ha_request_sync(void);  /* Request full sync from leader */
 int ha_is_sync_complete(void);
 uint64_t ha_get_sync_progress(void);
 
@@ -252,14 +253,20 @@ uint64_t ha_get_sync_progress(void);
 int ha_step_down(void);
 int ha_request_leadership(void);
 
+/* Peer communication */
+uint32_t ha_get_self_id(void);
+uint32_t ha_get_leader_id(void);
+int ha_send_to_leader(uint16_t type, const uint8_t *data, uint32_t len);
+int ha_send_to_peer(uint32_t peer_id, uint16_t type, const uint8_t *data, uint32_t len);
+
 /* Monitoring and stats */
 void ha_get_cluster_status(ha_cluster_t *status);
 void ha_get_peer_status(uint32_t peer_id, ha_peer_t *status);
 void ha_log_status(void);
 
-/* Synchronization and control */
-int ha_is_sync_complete(void);
-int ha_step_down(void);
+/* Sync data callback */
+typedef void (*ha_on_sync_data_fn)(const uint8_t *data, uint32_t len, uint64_t version, uint8_t is_last);
+void ha_set_sync_data_callback(ha_on_sync_data_fn fn);
 
 /* Callbacks for integration with master */
 typedef void (*ha_on_become_leader_fn)(void);

@@ -34,6 +34,7 @@ mfsmaster_SOURCES = \
 	openfiles.c openfiles.h \
 	hamanager.c hamanager.h \
 	ha_integration.c ha_integration.h \
+	ha_sync.c \
 	csdb.c csdb.h \
 	iptosesid.c iptosesid.h \
 	storageclass.c storageclass.h \
