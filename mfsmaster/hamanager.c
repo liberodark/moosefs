@@ -27,6 +27,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sys/time.h>
 #include <pthread.h>
 
 #include "hamanager.h"
@@ -116,9 +117,7 @@ const char* ha_state_str(ha_state_t state) {
 
 static int ha_connect_peer(ha_peer_t *peer) {
     int sock;
-    struct pollfd pfd;
-    int err;
-    socklen_t errlen = sizeof(err);
+    int flags;
     
     if (peer->is_connected && peer->sock >= 0) {
         return 0;
@@ -129,30 +128,24 @@ static int ha_connect_peer(ha_peer_t *peer) {
         return -1;
     }
     
-    tcpnonblock(sock);
     tcpnodelay(sock);
     
+    /* Set a connection timeout using setsockopt */
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
     if (tcpnumconnect(sock, peer->ip, peer->port) < 0) {
-        if (errno != EINPROGRESS) {
-            tcpclose(sock);
-            return -1;
-        }
-        
-        /* Wait for connection to complete (max 1 second) */
-        pfd.fd = sock;
-        pfd.events = POLLOUT;
-        pfd.revents = 0;
-        
-        if (poll(&pfd, 1, 1000) <= 0) {
-            tcpclose(sock);
-            return -1;
-        }
-        
-        /* Check if connection succeeded */
-        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0) {
-            tcpclose(sock);
-            return -1;
-        }
+        tcpclose(sock);
+        return -1;
+    }
+    
+    /* Ensure socket is in blocking mode */
+    flags = fcntl(sock, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
     }
     
     peer->sock = sock;
@@ -178,11 +171,18 @@ static int ha_send_message(ha_peer_t *peer, uint16_t type,
     uint8_t *buffer;
     uint32_t total_len;
     ssize_t sent;
+    int flags;
     
     if (!peer->is_connected || peer->sock < 0) {
         if (ha_connect_peer(peer) < 0) {
             return -1;
         }
+    }
+    
+    /* Ensure socket is blocking before send */
+    flags = fcntl(peer->sock, F_GETFL, 0);
+    if (flags != -1 && (flags & O_NONBLOCK)) {
+        fcntl(peer->sock, F_SETFL, flags & ~O_NONBLOCK);
     }
     
     /* Build header */
@@ -208,10 +208,18 @@ static int ha_send_message(ha_peer_t *peer, uint16_t type,
     sent = write(peer->sock, buffer, total_len);
     free(buffer);
     
+    if (sent < 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
+                "HA: Failed to send message to peer %u: %s (errno=%d, sock=%d)",
+                peer->id, strerror(errno), errno, peer->sock);
+        ha_disconnect_peer(peer);
+        return -1;
+    }
+    
     if (sent != (ssize_t)total_len) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
-                "HA: Failed to send message to peer %u: %s",
-                peer->id, strerror(errno));
+                "HA: Partial send to peer %u: sent %zd of %u bytes",
+                peer->id, sent, total_len);
         ha_disconnect_peer(peer);
         return -1;
     }
