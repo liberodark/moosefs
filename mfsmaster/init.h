@@ -39,6 +39,7 @@
 #include "bgsaver.h"
 #include "multilan.h"
 #include "hamanager.h"
+#include "ha_integration.h"
 
 #define MODULE_OPTIONS_GETOPT "iax"
 #define MODULE_OPTIONS_SWITCH \
@@ -65,6 +66,7 @@ struct {
 	{glob_cache_init,"glob engine"},
 	{multilan_init,"multilan map"},
 	{ha_init,"high availability manager"},
+	{ha_integration_init,"HA integration module"},
 	{changelog_init,"change log"},
 	{missing_log_init,"missing chunks/files log"}, // has to be before 'fs_init'
 	{dcm_init,"data cache manager"}, // has to be before 'fs_init' and 'matoclserv_init'

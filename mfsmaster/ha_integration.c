@@ -27,6 +27,10 @@
 #include "clocks.h"
 #include "datapack.h"
 
+/* External MooseFS functions for changelog handling */
+/* changelog_mr is declared in changelog.h */
+extern uint64_t meta_version(void);
+
 /* ============================================================================
  * Static Variables
  * ============================================================================ */
@@ -88,27 +92,63 @@ static void on_become_follower_cb(uint32_t leader_id) {
  * Called when a changelog entry is received from the leader
  */
 static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint32_t len) {
+    char *changelog_line;
+    uint64_t expected_version;
+    
     mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG, 
             "HA Integration: Received changelog version %lu, len=%u", version, len);
     
     /*
      * Apply the changelog entry to our local metadata
-     * This needs to call the merger/restore functions
+     * The data is a changelog line in text format: "OPERATION(params...)"
      */
     
-    /* Parse and apply changelog entry */
-    /* In real implementation:
-     * 1. Validate version matches expected
-     * 2. Parse changelog line
-     * 3. Apply to metadata using existing restore functions
-     * 4. Update local metadata version
-     */
+    /* Get expected version from metadata */
+    expected_version = meta_version();
     
-    /* For now, just log it */
-    if (len < 1000) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG, 
-                "HA Integration: Changelog entry: %.*s", (int)len, data);
+    /* Version check - we should receive changelogs in order */
+    if (version != expected_version + 1) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
+                "HA Integration: Version mismatch! Expected %lu, got %lu",
+                expected_version + 1, version);
+        
+        /* If we're behind, we need a full sync */
+        if (version > expected_version + 1) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
+                    "HA Integration: Gap detected, need full sync");
+            /* TODO: Request full metadata sync from leader */
+        }
+        /* If we're ahead, ignore (duplicate or old message) */
+        if (version <= expected_version) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG, 
+                    "HA Integration: Ignoring old changelog version %lu", version);
+            return;
+        }
     }
+    
+    /* Allocate buffer for null-terminated string */
+    changelog_line = malloc(len + 1);
+    if (changelog_line == NULL) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR, 
+                "HA Integration: Failed to allocate memory for changelog");
+        return;
+    }
+    
+    memcpy(changelog_line, data, len);
+    changelog_line[len] = '\0';
+    
+    /* Log the changelog entry for debugging */
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG, 
+            "HA Integration: Applying changelog: %lu: %s", version, changelog_line);
+    
+    /* Apply the changelog using MooseFS's restore function */
+    /* changelog_mr() parses and applies the changelog entry to metadata */
+    changelog_mr(version, changelog_line);
+    
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO, 
+            "HA Integration: Applied changelog version %lu", version);
+    
+    free(changelog_line);
 }
 
 /*
@@ -160,15 +200,27 @@ int ha_can_accept_write(void) {
 }
 
 int ha_should_replicate(void) {
+    int is_leader;
+    
     if (!ha_enabled) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG, 
+                "HA: ha_should_replicate: HA not enabled");
         return 0;  /* No HA, no replication */
     }
     
     /* Only replicate if we're the leader */
-    return ha_is_leader();
+    is_leader = ha_is_leader();
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE, 
+            "HA: ha_should_replicate: ha_enabled=%d, is_leader=%d", 
+            ha_enabled, is_leader);
+    return is_leader;
 }
 
 int ha_replicate_changelog_entry(uint64_t version, const uint8_t *data, uint32_t len) {
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE, 
+            "HA: ha_replicate_changelog_entry called: version=%lu, len=%u", 
+            version, len);
+    
     if (!ha_enabled || !ha_is_leader()) {
         return 0;
     }

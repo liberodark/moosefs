@@ -263,6 +263,7 @@ void changelog(const char *format,...) {
 	changelog_store_logstring(version,(uint8_t*)printbuff,leng);
 	lastchange = monotonic_seconds();
 
+	/* Replicate to HA followers if we're leader */
 	if (ha_should_replicate()) {
 		ha_replicate_changelog_entry(version, (uint8_t*)printbuff, leng);
 	}
