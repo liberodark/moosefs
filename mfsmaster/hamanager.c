@@ -897,6 +897,35 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
                 }
             }
             break;
+        case HA_MSG_CATCHUP_REQUEST:
+            /* Follower requests changelog catchup (metalogger-style decision) */
+            if (cluster->state == HA_STATE_LEADER && payload_len >= 8) {
+                const uint8_t *req_ptr = payload;
+                uint64_t follower_version = get64bit(&req_ptr);
+                uint64_t chlog_minversion = changelog_get_minversion();
+
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                        "HA: Peer %u requests catchup from version %"PRIu64" (min_changelog=%"PRIu64")",
+                        peer->id, follower_version, chlog_minversion);
+
+                if (chlog_minversion == 0 || chlog_minversion > follower_version + 1) {
+                    /* Changelogs not available - need full sync */
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                            "HA: Peer %u needs full sync (requested %"PRIu64", min available %"PRIu64")",
+                            peer->id, follower_version + 1, chlog_minversion);
+                    peer->logstate = HA_LOGSTATE_NONE;
+                    /* TODO: trigger full metadata sync to this peer */
+                } else {
+                    /* Catchup possible - switch to DELAYED and send old changelogs */
+                    peer->logstate = HA_LOGSTATE_DELAYED;
+                    peer->next_log_version = follower_version + 1;
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                            "HA: Peer %u set to DELAYED, starting catchup from %"PRIu64,
+                            peer->id, peer->next_log_version);
+                    ha_catchup_peer(peer);
+                }
+            }
+            break;
         case HA_MSG_SYNC_REQUEST:
             ha_handle_sync_request(peer, payload, payload_len);
             break;
@@ -1915,4 +1944,20 @@ int ha_send_to_peer(uint32_t peer_id, uint16_t type, const uint8_t *data, uint32
     mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
             "HA: Peer %u not found or not connected", peer_id);
     return -1;
+}
+
+/*
+ * Request changelog catchup from leader (called by follower)
+ * Leader will decide: catchup from changelogs or full sync needed
+ */
+int ha_request_catchup(uint64_t my_version) {
+    uint8_t payload[8];
+    uint8_t *ptr = payload;
+
+    put64bit(&ptr, my_version);
+
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA: Requesting catchup from leader (my_version=%"PRIu64")", my_version);
+
+    return ha_send_to_leader(HA_MSG_CATCHUP_REQUEST, payload, 8);
 }

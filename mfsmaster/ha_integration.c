@@ -828,13 +828,14 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
         return;
     }
 
-    /* If we're behind by more than 1, we need a full sync */
+    /* If we're behind by more than 1, request catchup from leader */
+    /* Leader will decide: changelog catchup or full sync needed */
     if (version > current_version + 1) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                "HA Integration: Gap detected! Expected %lu, got %lu - requesting full sync",
+                "HA Integration: Gap detected! Expected %lu, got %lu - requesting catchup",
                 current_version + 1, version);
         buffer_changelog(version, data, len);
-        request_full_sync();
+        ha_request_catchup(current_version);
         return;
     }
 
@@ -880,6 +881,11 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
     if (result == 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA Integration: Applied changelog %lu to memory (ts=%u)", version, ts);
+
+        /* Check if we can apply buffered changelogs (after catchup) */
+        if (changelog_buffer_count > 0) {
+            apply_buffered_changelogs();
+        }
     } else {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
                 "HA Integration: Failed to apply changelog %lu (result=%d) - requesting full sync",

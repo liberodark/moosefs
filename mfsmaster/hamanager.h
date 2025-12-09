@@ -77,6 +77,7 @@ typedef enum {
     HA_MSG_SYNC_INFO            = 0x0025,   /* Sync info: file size */
     HA_MSG_SYNC_CHUNK_REQUEST   = 0x0026,   /* Request chunk (offset, size) */
     HA_MSG_SYNC_CHUNK_DATA      = 0x0027,   /* Chunk data (offset, size, CRC, data) */
+    HA_MSG_CATCHUP_REQUEST      = 0x0028,   /* Request changelog catchup (follower_version) */
 
     /* Health and monitoring */
     HA_MSG_PING                 = 0x0030,   /* Simple ping */
@@ -277,6 +278,7 @@ uint32_t ha_get_self_id(void);
 uint32_t ha_get_leader_id(void);
 int ha_send_to_leader(uint16_t type, const uint8_t *data, uint32_t len);
 int ha_send_to_peer(uint32_t peer_id, uint16_t type, const uint8_t *data, uint32_t len);
+int ha_request_catchup(uint64_t my_version);  /* Request changelog catchup from leader */
 
 /* Monitoring and stats */
 void ha_get_cluster_status(ha_cluster_t *status);
