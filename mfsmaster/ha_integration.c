@@ -30,11 +30,10 @@
 #include "matoclserv.h"
 #include "clocks.h"
 #include "datapack.h"
+#include "restore.h"
 
 /* External MooseFS functions for changelog handling */
-/* changelog_mr is declared in changelog.h */
 extern uint64_t meta_version(void);
-extern int meta_restore(void);  /* Reload metadata from file */
 
 /* ============================================================================
  * Static Variables
@@ -54,6 +53,10 @@ static uint8_t sync_needed = 0;
 static uint64_t last_sync_request_time = 0;
 static uint64_t changelog_buffer_count = 0;
 static char *data_path_cache = NULL;
+
+/* Changelog file for persistence (like metalogger) */
+static FILE *changelog_fd = NULL;
+static uint32_t changelog_file_version = 0;
 
 /* Changelog buffer for when sync is in progress */
 #define CHANGELOG_BUFFER_SIZE 1000
@@ -175,6 +178,8 @@ static void apply_buffered_changelogs(void) {
     changelog_entry_t *entry;
     char *changelog_line;
     uint32_t applied = 0;
+    uint32_t ts;
+    int result;
 
     current_version = meta_version();
 
@@ -194,12 +199,27 @@ static void apply_buffered_changelogs(void) {
                 changelog_line[entry->len] = '\0';
 
                 pthread_mutex_unlock(&ha_int_mutex);
-                changelog_mr(entry->version, changelog_line);
+                
+                /* Write to disk */
+                if (changelog_fd != NULL) {
+                    fprintf(changelog_fd, "%"PRIu64": %s\n", entry->version, changelog_line);
+                    fflush(changelog_fd);
+                }
+                
+                /* Apply to memory */
+                result = restore_net(entry->version, changelog_line, &ts);
+                if (result == 0) {
+                    current_version = entry->version;
+                    applied++;
+                } else {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                            "HA Integration: Failed to apply buffered changelog %lu",
+                            entry->version);
+                }
+                
                 pthread_mutex_lock(&ha_int_mutex);
 
                 free(changelog_line);
-                current_version = entry->version;
-                applied++;
             }
             free(entry->data);
             entry->data = NULL;
@@ -217,54 +237,49 @@ static void apply_buffered_changelogs(void) {
 
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Integration: Applied %u buffered changelogs, now at version %lu",
-            applied, current_version);
+            applied, meta_version());
 }
 
 /*
  * Called when a changelog entry is received from the leader
+ * This implements dual persistence: disk + memory (like metalogger but with live apply)
  */
 static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint32_t len) {
     char *changelog_line;
     uint64_t current_version;
+    uint32_t ts;
+    int result;
 
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
             "HA Integration: Received changelog version %lu, len=%u", version, len);
 
     /* If sync is in progress, buffer the changelog for later */
     if (ha_sync_is_in_progress()) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
                 "HA Integration: Sync in progress, buffering changelog %lu", version);
         buffer_changelog(version, data, len);
         return;
     }
 
-    /*
-     * Apply the changelog entry to our local metadata
-     * The data is a changelog line in text format: "OPERATION(params...)"
-     */
-
     /* Get expected version from metadata */
     current_version = meta_version();
 
     /* Version check - we should receive changelogs in order */
-    if (version != current_version + 1) {
-        /* If we're ahead, ignore (duplicate or old message) */
-        if (version <= current_version) {
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                    "HA Integration: Ignoring old changelog version %lu (current=%lu)",
-                    version, current_version);
-            return;
-        }
+    if (version <= current_version) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                "HA Integration: Ignoring old changelog version %lu (current=%lu)",
+                version, current_version);
+        return;
+    }
 
-        /* If we're behind by more than 1, we need a full sync */
-        if (version > current_version + 1) {
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                    "HA Integration: Gap detected! Expected %lu, got %lu - requesting full sync",
-                    current_version + 1, version);
-            buffer_changelog(version, data, len);  /* Buffer this one too */
-            request_full_sync();
-            return;
-        }
+    /* If we're behind by more than 1, we need a full sync */
+    if (version > current_version + 1) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA Integration: Gap detected! Expected %lu, got %lu - requesting full sync",
+                current_version + 1, version);
+        buffer_changelog(version, data, len);
+        request_full_sync();
+        return;
     }
 
     /* Allocate buffer for null-terminated string */
@@ -278,16 +293,42 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
     memcpy(changelog_line, data, len);
     changelog_line[len] = '\0';
 
-    /* Log the changelog entry for debugging */
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
-            "HA Integration: Applying changelog: %lu: %s", version, changelog_line);
+    /*
+     * STEP 1: Write to disk for persistence (like metalogger)
+     */
+    if (changelog_fd == NULL) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/changelog_ha.0.mfs", 
+                 data_path_cache ? data_path_cache : "/var/lib/mfs");
+        changelog_fd = fopen(path, "a");
+        if (changelog_fd == NULL) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                    "HA Integration: Cannot open changelog file for writing");
+        }
+    }
+    
+    if (changelog_fd != NULL) {
+        fprintf(changelog_fd, "%"PRIu64": %s\n", version, changelog_line);
+        fflush(changelog_fd);
+    }
 
-    /* Apply the changelog using MooseFS's restore function */
-    /* changelog_mr() parses and applies the changelog entry to metadata */
-    changelog_mr(version, changelog_line);
+    /*
+     * STEP 2: Apply to memory using restore_net()
+     * This is the key difference from metalogger - we apply LIVE
+     */
+    result = restore_net(version, changelog_line, &ts);
 
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
-            "HA Integration: Applied changelog version %lu", version);
+    if (result == 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                "HA Integration: Applied changelog %lu to memory (ts=%u)", version, ts);
+    } else {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA Integration: Failed to apply changelog %lu (result=%d) - requesting full sync",
+                version, result);
+        free(changelog_line);
+        request_full_sync();
+        return;
+    }
 
     free(changelog_line);
 }
@@ -353,6 +394,9 @@ int ha_integration_init(void) {
         return 0;
     }
 
+    /* Cache data path for changelog file */
+    data_path_cache = cfg_getstr("DATA_PATH", "/var/lib/mfs");
+
     /* Initialize sync module */
     if (ha_sync_init() < 0) {
         mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_ERR,
@@ -376,9 +420,26 @@ int ha_integration_init(void) {
     changelog_buffer_count = 0;
 
     mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_INFO,
-            "HA Integration: Initialized with sync module");
+            "HA Integration: Initialized with restore_net() for live changelog application");
 
     return 0;
+}
+
+void ha_integration_term(void) {
+    /* Close changelog file if open */
+    if (changelog_fd != NULL) {
+        fclose(changelog_fd);
+        changelog_fd = NULL;
+    }
+    
+    /* Free data path cache */
+    if (data_path_cache != NULL) {
+        free(data_path_cache);
+        data_path_cache = NULL;
+    }
+    
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+            "HA Integration: Terminated");
 }
 
 int ha_is_enabled(void) {

@@ -19,6 +19,12 @@
 int ha_integration_init(void);
 
 /*
+ * Terminate HA integration
+ * Cleanup resources
+ */
+void ha_integration_term(void);
+
+/*
  * Check if HA is enabled
  */
 int ha_is_enabled(void);
