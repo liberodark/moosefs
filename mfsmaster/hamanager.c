@@ -58,6 +58,7 @@ static ha_on_become_leader_fn on_become_leader = NULL;
 static ha_on_become_follower_fn on_become_follower = NULL;
 static ha_on_changelog_received_fn on_changelog_received = NULL;
 static ha_on_sync_complete_fn on_sync_complete = NULL;
+static ha_on_sync_data_fn sync_info_callback = NULL;
 
 /* Configuration */
 static char *HA_PeerList = NULL;
@@ -75,6 +76,7 @@ static uint64_t log_buffer_count __attribute__((unused)) = 0;
 static void ha_send_heartbeats(void);
 static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_t len);
 static void ha_handle_sync_response(ha_peer_t *peer, const uint8_t *data, uint32_t len);
+static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, uint32_t len);
 
 /* ============================================================================
  * Utility Functions
@@ -702,16 +704,26 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
         case HA_MSG_CHANGELOG_ENTRY:
             ha_handle_changelog_entry(peer, payload, payload_len);
             break;
+        case HA_MSG_CHANGELOG_ACK:
+            /* ACK received from follower - could track for reliability */
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                    "HA: Received changelog ACK from peer %u", peer->id);
+            break;
         case HA_MSG_SYNC_REQUEST:
             ha_handle_sync_request(peer, payload, payload_len);
             break;
         case HA_MSG_SYNC_RESPONSE:
             ha_handle_sync_response(peer, payload, payload_len);
             break;
-        case HA_MSG_CHANGELOG_ACK:
-            /* ACK from follower acknowledging changelog receipt - no action needed */
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
-                    "HA: Received changelog ACK from peer %u", peer->id);
+        case HA_MSG_SYNC_CHUNK_REQUEST:
+            ha_handle_sync_chunk_request(peer, payload, payload_len);
+            break;
+        case HA_MSG_SYNC_INFO:
+        case HA_MSG_SYNC_CHUNK_DATA:
+            /* These are handled by ha_integration callback */
+            if (sync_info_callback != NULL) {
+                sync_info_callback(header.type, payload, payload_len);
+            }
             break;
         case HA_MSG_PING:
             ha_send_message(peer, HA_MSG_PONG, NULL, 0);
@@ -854,15 +866,17 @@ int ha_init(void) {
     cluster->self_port = HA_Port;
     tcpgetmyaddr(ha_lsock, &cluster->self_ip, NULL);
 
-    /* Determine self_id from HA_SELF_IP */
-    {
-        char *self_ip_str = cfg_getstr("HA_SELF_IP", NULL);
-        if (self_ip_str != NULL && self_ip_str[0] != '\0') {
-            uint32_t self_ip;
-            if (tcpresolve(self_ip_str, NULL, &self_ip, NULL, 1) >= 0) {
-                cluster->self_ip = self_ip;
+    /* Determine self_id - priority: HA_NODE_ID > MATOCS_LISTEN_HOST > auto-detect */
+    cluster->self_id = cfg_getuint32("HA_NODE_ID", 0);
+    if (cluster->self_id == 0) {
+        /* Try to get IP from MATOCS_LISTEN_HOST */
+        char *matocs_host = cfg_getstr("MATOCS_LISTEN_HOST", NULL);
+        if (matocs_host != NULL && matocs_host[0] != '*' && matocs_host[0] != '\0') {
+            uint32_t matocs_ip;
+            if (tcpresolve(matocs_host, NULL, &matocs_ip, NULL, 1) >= 0) {
+                cluster->self_ip = matocs_ip;
             }
-            free(self_ip_str);
+            free(matocs_host);
         }
         cluster->self_id = ha_generate_peer_id(cluster->self_ip, HA_Port);
     }
@@ -1150,19 +1164,17 @@ int ha_request_sync(void) {
 
 /*
  * Handle sync request from a follower (leader side)
+ * Now sends SYNC_INFO with file size, follower will request chunks
  */
 static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_t len) {
     const uint8_t *rptr = data;
     uint64_t follower_version;
-    uint32_t follower_id;
+    uint64_t follower_checksum;
     char *data_path;
     char metadata_path[PATH_MAX];
     struct stat st;
-    int fd;
-    uint8_t *file_data;
-    uint8_t *response;
+    uint8_t response[24];
     uint8_t *ptr;
-    ssize_t bytes_read;
     uint64_t my_version;
 
     if (len < 16) {
@@ -1170,13 +1182,14 @@ static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_
     }
 
     follower_version = get64bit(&rptr);
-    follower_id = get32bit(&rptr);
+    follower_checksum = get64bit(&rptr);
+    (void)follower_checksum;  /* May use later for incremental sync */
 
     extern uint64_t meta_version(void);
     my_version = meta_version();
 
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA: Received sync request from peer %u (their version=%lu, my version=%lu)",
+            "HA: Received sync request from peer %u (their version=%"PRIu64", my version=%"PRIu64")",
             peer->id, follower_version, my_version);
 
     if (cluster->state != HA_STATE_LEADER) {
@@ -1203,59 +1216,118 @@ static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_
         }
     }
 
+    /* Store path for chunk requests */
+    strncpy(peer->sync_path, metadata_path, sizeof(peer->sync_path) - 1);
+    peer->sync_path[sizeof(peer->sync_path) - 1] = '\0';
+    peer->sync_filesize = st.st_size;
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA: Sending metadata file %s (size=%lu) to peer %u",
-            metadata_path, (unsigned long)st.st_size, peer->id);
+            "HA: Sending sync info for %s (size=%"PRIu64") to peer %u",
+            metadata_path, (uint64_t)st.st_size, peer->id);
 
-    /* Open and read metadata file */
-    fd = open(metadata_path, O_RDONLY);
-    if (fd < 0) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA: Cannot open metadata file: %s", strerror(errno));
-        return;
-    }
-
-    /* Allocate buffer for file data */
-    file_data = malloc(st.st_size);
-    if (file_data == NULL) {
-        close(fd);
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA: Cannot allocate memory for metadata");
-        return;
-    }
-
-    bytes_read = read(fd, file_data, st.st_size);
-    close(fd);
-
-    if (bytes_read != st.st_size) {
-        free(file_data);
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA: Failed to read metadata file");
-        return;
-    }
-
-    /* Build sync response: version(8) + file_size(8) + file_data */
-    response = malloc(16 + st.st_size);
-    if (response == NULL) {
-        free(file_data);
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA: Cannot allocate memory for sync response");
-        return;
-    }
-
+    /* Send SYNC_INFO: version(8) + filesize(8) */
     ptr = response;
     put64bit(&ptr, my_version);
-    put64bit(&ptr, st.st_size);
-    memcpy(ptr, file_data, st.st_size);
+    put64bit(&ptr, (uint64_t)st.st_size);
 
-    /* Send sync response */
-    ha_send_message(peer, HA_MSG_SYNC_RESPONSE, response, 16 + st.st_size);
+    ha_send_message(peer, HA_MSG_SYNC_INFO, response, 16);
+}
 
-    free(file_data);
+/*
+ * Handle chunk request from follower (leader side)
+ * Sends chunk with CRC like metalogger does
+ */
+static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, uint32_t len) {
+    const uint8_t *rptr = data;
+    uint64_t offset;
+    uint32_t size;
+    uint8_t *response;
+    uint8_t *ptr;
+    int fd;
+    ssize_t bytes_read;
+    uint32_t crc;
+
+    if (len < 12) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Chunk request too short");
+        return;
+    }
+
+    offset = get64bit(&rptr);
+    size = get32bit(&rptr);
+
+    if (cluster->state != HA_STATE_LEADER) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Ignoring chunk request - I'm not the leader");
+        return;
+    }
+
+    if (peer->sync_path[0] == '\0') {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Chunk request without prior sync request");
+        return;
+    }
+
+    /* Validate request */
+    if (offset + size > peer->sync_filesize) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Chunk request out of bounds (offset=%"PRIu64", size=%u, filesize=%"PRIu64")",
+                offset, size, peer->sync_filesize);
+        return;
+    }
+
+    /* Allocate response: offset(8) + size(4) + crc(4) + data */
+    response = malloc(16 + size);
+    if (response == NULL) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA: Cannot allocate memory for chunk response");
+        return;
+    }
+
+    /* Read chunk from file */
+    fd = open(peer->sync_path, O_RDONLY);
+    if (fd < 0) {
+        free(response);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA: Cannot open metadata file for chunk: %s", strerror(errno));
+        return;
+    }
+
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        close(fd);
+        free(response);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA: Cannot seek in metadata file");
+        return;
+    }
+
+    bytes_read = read(fd, response + 16, size);
+    close(fd);
+
+    if (bytes_read != (ssize_t)size) {
+        free(response);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA: Failed to read chunk from metadata file");
+        return;
+    }
+
+    /* Calculate CRC */
+    crc = mycrc32(0, response + 16, size);
+
+    /* Build response header */
+    ptr = response;
+    put64bit(&ptr, offset);
+    put32bit(&ptr, size);
+    put32bit(&ptr, crc);
+
+    /* Send chunk */
+    ha_send_message(peer, HA_MSG_SYNC_CHUNK_DATA, response, 16 + size);
+
     free(response);
 
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA: Sent metadata sync response to peer %u", peer->id);
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+            "HA: Sent chunk offset=%"PRIu64" size=%u crc=0x%08X to peer %u",
+            offset, size, crc, peer->id);
 }
 
 /*
@@ -1331,9 +1403,8 @@ static void ha_handle_sync_response(ha_peer_t *peer, const uint8_t *data, uint32
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA: Metadata file synced successfully (version=%lu)", leader_version);
 
-    /* Mark sync as complete in both hamanager and ha_sync */
+    /* Mark sync as complete */
     cluster->sync_in_progress = 0;
-    ha_sync_mark_complete();
 
     /* Notify integration layer to reload metadata */
     if (on_sync_complete != NULL) {

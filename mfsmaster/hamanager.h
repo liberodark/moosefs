@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <poll.h>
+#include <limits.h>
 
 /*
  * MooseFS HA Manager
@@ -36,6 +37,7 @@
 #define HA_ELECTION_TIMEOUT_MAX 3000        /* Maximum election timeout (ms) */
 #define HA_CHANGELOG_BATCH_SIZE 1000        /* Max changelog entries per sync */
 #define HA_SYNC_TIMEOUT_MS      5000        /* Sync timeout in milliseconds */
+#define HA_META_DL_BLOCK        1000000     /* Metadata download block size (1MB, like metalogger) */
 
 /* ============================================================================
  * HA State Definitions
@@ -73,6 +75,9 @@ typedef enum {
     HA_MSG_CHANGELOG_ENTRY      = 0x0022,   /* Single changelog entry */
     HA_MSG_CHANGELOG_BATCH      = 0x0023,   /* Batch of changelog entries */
     HA_MSG_CHANGELOG_ACK        = 0x0024,   /* Acknowledge changelog receipt */
+    HA_MSG_SYNC_INFO            = 0x0025,   /* Sync info: file size */
+    HA_MSG_SYNC_CHUNK_REQUEST   = 0x0026,   /* Request chunk (offset, size) */
+    HA_MSG_SYNC_CHUNK_DATA      = 0x0027,   /* Chunk data (offset, size, CRC, data) */
 
     /* Health and monitoring */
     HA_MSG_PING                 = 0x0030,   /* Simple ping */
@@ -103,6 +108,9 @@ typedef struct ha_peer {
     uint8_t     vote_granted;               /* Vote granted in current term */
     uint8_t     is_connected;               /* Connection status */
     char        hostname[256];              /* Hostname string */
+    /* Sync state for chunked transfer */
+    char        sync_path[PATH_MAX];        /* Path to metadata file being synced */
+    uint64_t    sync_filesize;              /* Size of file being synced */
 } ha_peer_t;
 
 /* Changelog entry for replication */
@@ -264,8 +272,8 @@ void ha_get_cluster_status(ha_cluster_t *status);
 void ha_get_peer_status(uint32_t peer_id, ha_peer_t *status);
 void ha_log_status(void);
 
-/* Sync data callback */
-typedef void (*ha_on_sync_data_fn)(const uint8_t *data, uint32_t len, uint64_t version, uint8_t is_last);
+/* Sync data callback - receives message type, payload and length */
+typedef void (*ha_on_sync_data_fn)(uint16_t msg_type, const uint8_t *data, uint32_t len);
 void ha_set_sync_data_callback(ha_on_sync_data_fn fn);
 
 /* Callbacks for integration with master */
