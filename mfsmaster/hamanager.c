@@ -72,11 +72,174 @@ static ha_log_entry_t *log_buffer __attribute__((unused)) = NULL;
 static uint64_t log_buffer_start __attribute__((unused)) = 0;
 static uint64_t log_buffer_count __attribute__((unused)) = 0;
 
+/* Changelog buffer for reliable replication (ACK + retry) */
+typedef struct {
+    uint64_t version;
+    uint8_t *data;
+    uint32_t len;
+    double timestamp;
+} changelog_buffer_entry_t;
+
+#define CHANGELOG_BUFFER_SIZE 10000
+static changelog_buffer_entry_t *changelog_buffer = NULL;
+static uint32_t changelog_buffer_head = 0;  /* Next write position */
+static uint32_t changelog_buffer_count = 0;
+static uint64_t changelog_buffer_first_version = 0;
+static pthread_mutex_t changelog_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* Forward declarations */
 static void ha_send_heartbeats(void);
 static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_t len);
 static void ha_handle_sync_response(ha_peer_t *peer, const uint8_t *data, uint32_t len);
 static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, uint32_t len);
+static int ha_send_message(ha_peer_t *peer, uint16_t type, const uint8_t *payload, uint32_t payload_len);
+
+/* ============================================================================
+ * Changelog Buffer Functions (for ACK + retry)
+ * ============================================================================ */
+
+/*
+ * Initialize changelog buffer
+ */
+static void changelog_buffer_init(void) {
+    if (changelog_buffer == NULL) {
+        changelog_buffer = calloc(CHANGELOG_BUFFER_SIZE, sizeof(changelog_buffer_entry_t));
+        if (changelog_buffer == NULL) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                    "HA: Failed to allocate changelog buffer");
+        }
+    }
+}
+
+/*
+ * Add changelog entry to buffer
+ */
+static void changelog_buffer_add(uint64_t version, const uint8_t *data, uint32_t len) {
+    changelog_buffer_entry_t *entry;
+    
+    if (changelog_buffer == NULL) {
+        return;
+    }
+    
+    pthread_mutex_lock(&changelog_buffer_mutex);
+    
+    entry = &changelog_buffer[changelog_buffer_head];
+    
+    /* Free old entry if present */
+    if (entry->data != NULL) {
+        free(entry->data);
+    }
+    
+    /* Store new entry */
+    entry->version = version;
+    entry->data = malloc(len);
+    if (entry->data != NULL) {
+        memcpy(entry->data, data, len);
+        entry->len = len;
+        entry->timestamp = monotonic_seconds();
+    } else {
+        entry->len = 0;
+    }
+    
+    /* Update buffer state */
+    changelog_buffer_head = (changelog_buffer_head + 1) % CHANGELOG_BUFFER_SIZE;
+    if (changelog_buffer_count < CHANGELOG_BUFFER_SIZE) {
+        changelog_buffer_count++;
+        if (changelog_buffer_count == 1) {
+            changelog_buffer_first_version = version;
+        }
+    } else {
+        changelog_buffer_first_version++;
+    }
+    
+    pthread_mutex_unlock(&changelog_buffer_mutex);
+}
+
+/*
+ * Get changelog entry from buffer by version
+ * Returns NULL if not found
+ */
+static changelog_buffer_entry_t *changelog_buffer_get(uint64_t version) {
+    uint32_t index;
+    changelog_buffer_entry_t *entry;
+    
+    if (changelog_buffer == NULL || changelog_buffer_count == 0) {
+        return NULL;
+    }
+    
+    /* Check if version is in range */
+    if (version < changelog_buffer_first_version || 
+        version >= changelog_buffer_first_version + changelog_buffer_count) {
+        return NULL;
+    }
+    
+    /* Calculate index */
+    index = (changelog_buffer_head - changelog_buffer_count + 
+             (version - changelog_buffer_first_version)) % CHANGELOG_BUFFER_SIZE;
+    
+    entry = &changelog_buffer[index];
+    if (entry->version == version && entry->data != NULL) {
+        return entry;
+    }
+    
+    return NULL;
+}
+
+/*
+ * Send missing changelogs to a peer that's behind
+ * Called when we receive an ACK and detect the peer is behind
+ */
+static void ha_resend_missing_changelogs(ha_peer_t *peer, uint64_t acked_version) {
+    uint64_t version;
+    uint64_t current_max;
+    changelog_buffer_entry_t *entry;
+    uint8_t *payload;
+    uint8_t *ptr;
+    uint32_t payload_len;
+    int resent = 0;
+    
+    if (cluster->state != HA_STATE_LEADER) {
+        return;
+    }
+    
+    pthread_mutex_lock(&changelog_buffer_mutex);
+    current_max = changelog_buffer_first_version + changelog_buffer_count - 1;
+    pthread_mutex_unlock(&changelog_buffer_mutex);
+    
+    /* Resend up to 100 missing changelogs at once */
+    for (version = acked_version + 1; version <= current_max && resent < 100; version++) {
+        entry = changelog_buffer_get(version);
+        if (entry == NULL) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                    "HA: Cannot resend version %"PRIu64" - not in buffer", version);
+            break;
+        }
+        
+        /* Build and send changelog entry */
+        payload_len = 8 + 4 + entry->len;
+        payload = malloc(payload_len);
+        if (payload == NULL) {
+            break;
+        }
+        
+        ptr = payload;
+        put64bit(&ptr, version);
+        put32bit(&ptr, entry->len);
+        memcpy(ptr, entry->data, entry->len);
+        
+        if (ha_send_message(peer, HA_MSG_CHANGELOG_ENTRY, payload, payload_len) == 0) {
+            resent++;
+        }
+        
+        free(payload);
+    }
+    
+    if (resent > 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA: Resent %d changelogs to peer %u (versions %"PRIu64"-%"PRIu64")",
+                resent, peer->id, acked_version + 1, acked_version + resent);
+    }
+}
 
 /* ============================================================================
  * Utility Functions
@@ -705,9 +868,31 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
             ha_handle_changelog_entry(peer, payload, payload_len);
             break;
         case HA_MSG_CHANGELOG_ACK:
-            /* ACK received from follower - could track for reliability */
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
-                    "HA: Received changelog ACK from peer %u", peer->id);
+            /* ACK received from follower - track version and resend missing */
+            if (payload_len >= 8) {
+                const uint8_t *ack_ptr = payload;
+                uint64_t acked_version = get64bit(&ack_ptr);
+                uint64_t current_max = 0;
+                
+                /* Update peer's acked version */
+                if (acked_version > peer->acked_version) {
+                    peer->acked_version = acked_version;
+                }
+                
+                /* Check if peer is behind and resend missing changelogs */
+                pthread_mutex_lock(&changelog_buffer_mutex);
+                if (changelog_buffer_count > 0) {
+                    current_max = changelog_buffer_first_version + changelog_buffer_count - 1;
+                }
+                pthread_mutex_unlock(&changelog_buffer_mutex);
+                
+                if (current_max > 0 && acked_version < current_max) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                            "HA: Peer %u acked %"PRIu64" but current is %"PRIu64", resending",
+                            peer->id, acked_version, current_max);
+                    ha_resend_missing_changelogs(peer, acked_version);
+                }
+            }
             break;
         case HA_MSG_SYNC_REQUEST:
             ha_handle_sync_request(peer, payload, payload_len);
@@ -834,6 +1019,9 @@ int ha_init(void) {
             cluster->heartbeat_interval_ms,
             cluster->election_timeout_min_ms,
             cluster->election_timeout_max_ms);
+
+    /* Initialize changelog buffer for reliable replication */
+    changelog_buffer_init();
 
     /* Create listening socket */
     ha_lsock = tcpsocket();
@@ -1085,6 +1273,9 @@ int ha_replicate_changelog(uint64_t version, const uint8_t *data, uint32_t len) 
     if (cluster->state != HA_STATE_LEADER) {
         return -1;  /* Only leader can replicate */
     }
+
+    /* Store in buffer for potential retry */
+    changelog_buffer_add(version, data, len);
 
     /* Build changelog entry message */
     payload_len = 8 + 4 + len;  /* version + data_len + data */

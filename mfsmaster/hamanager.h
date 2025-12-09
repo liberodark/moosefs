@@ -111,6 +111,8 @@ typedef struct ha_peer {
     /* Sync state for chunked transfer */
     char        sync_path[PATH_MAX];        /* Path to metadata file being synced */
     uint64_t    sync_filesize;              /* Size of file being synced */
+    /* Changelog replication tracking */
+    uint64_t    acked_version;              /* Last changelog version ACKed by this peer */
 } ha_peer_t;
 
 /* Changelog entry for replication */
