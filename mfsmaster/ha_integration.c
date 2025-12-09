@@ -84,15 +84,43 @@ static uint32_t changelog_buffer_tail = 0;
 static int metadata_file_exists(const char *data_path) {
     char path[PATH_MAX];
     struct stat st;
+    int fd;
+    char header[8];
     
+    /* Check metadata.mfs */
     snprintf(path, sizeof(path), "%s/metadata.mfs", data_path);
-    if (stat(path, &st) == 0 && st.st_size > 100) {
-        return 1;
+    if (stat(path, &st) == 0 && st.st_size > 1000) {
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            if (read(fd, header, 8) == 8) {
+                close(fd);
+                /* Check for valid signature, not "MFSM NEW" */
+                if (memcmp(header, "MFSM ", 5) == 0 && 
+                    memcmp(header, "MFSM NEW", 8) != 0) {
+                    return 1;
+                }
+            } else {
+                close(fd);
+            }
+        }
     }
     
+    /* Check metadata.mfs.back */
     snprintf(path, sizeof(path), "%s/metadata.mfs.back", data_path);
-    if (stat(path, &st) == 0 && st.st_size > 100) {
-        return 1;
+    if (stat(path, &st) == 0 && st.st_size > 1000) {
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            if (read(fd, header, 8) == 8) {
+                close(fd);
+                /* Check for valid signature, not "MFSM NEW" */
+                if (memcmp(header, "MFSM ", 5) == 0 && 
+                    memcmp(header, "MFSM NEW", 8) != 0) {
+                    return 1;
+                }
+            } else {
+                close(fd);
+            }
+        }
     }
     
     return 0;
