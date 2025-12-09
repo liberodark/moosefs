@@ -72,21 +72,6 @@ static ha_log_entry_t *log_buffer __attribute__((unused)) = NULL;
 static uint64_t log_buffer_start __attribute__((unused)) = 0;
 static uint64_t log_buffer_count __attribute__((unused)) = 0;
 
-/* Changelog buffer for reliable replication (ACK + retry) */
-typedef struct {
-    uint64_t version;
-    uint8_t *data;
-    uint32_t len;
-    double timestamp;
-} changelog_buffer_entry_t;
-
-#define CHANGELOG_BUFFER_SIZE 10000
-static changelog_buffer_entry_t *changelog_buffer = NULL;
-static uint32_t changelog_buffer_head = 0;  /* Next write position */
-static uint32_t changelog_buffer_count = 0;
-static uint64_t changelog_buffer_first_version = 0;
-static pthread_mutex_t changelog_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 /* Forward declarations */
 static void ha_send_heartbeats(void);
 static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_t len);
@@ -95,149 +80,144 @@ static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, u
 static int ha_send_message(ha_peer_t *peer, uint16_t type, const uint8_t *payload, uint32_t payload_len);
 
 /* ============================================================================
- * Changelog Buffer Functions (for ACK + retry)
+ * Changelog Replication Functions (metalogger-style)
  * ============================================================================ */
 
 /*
- * Initialize changelog buffer
+ * Callback for changelog_get_old_changes() - sends changelog to peer
+ * This is the same pattern used by matomlserv.c for metaloggers
  */
-static void changelog_buffer_init(void) {
-    if (changelog_buffer == NULL) {
-        changelog_buffer = calloc(CHANGELOG_BUFFER_SIZE, sizeof(changelog_buffer_entry_t));
-        if (changelog_buffer == NULL) {
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                    "HA: Failed to allocate changelog buffer");
-        }
-    }
-}
-
-/*
- * Add changelog entry to buffer
- */
-static void changelog_buffer_add(uint64_t version, const uint8_t *data, uint32_t len) {
-    changelog_buffer_entry_t *entry;
-    
-    if (changelog_buffer == NULL) {
-        return;
-    }
-    
-    pthread_mutex_lock(&changelog_buffer_mutex);
-    
-    entry = &changelog_buffer[changelog_buffer_head];
-    
-    /* Free old entry if present */
-    if (entry->data != NULL) {
-        free(entry->data);
-    }
-    
-    /* Store new entry */
-    entry->version = version;
-    entry->data = malloc(len);
-    if (entry->data != NULL) {
-        memcpy(entry->data, data, len);
-        entry->len = len;
-        entry->timestamp = monotonic_seconds();
-    } else {
-        entry->len = 0;
-    }
-    
-    /* Update buffer state */
-    changelog_buffer_head = (changelog_buffer_head + 1) % CHANGELOG_BUFFER_SIZE;
-    if (changelog_buffer_count < CHANGELOG_BUFFER_SIZE) {
-        changelog_buffer_count++;
-        if (changelog_buffer_count == 1) {
-            changelog_buffer_first_version = version;
-        }
-    } else {
-        changelog_buffer_first_version++;
-    }
-    
-    pthread_mutex_unlock(&changelog_buffer_mutex);
-}
-
-/*
- * Get changelog entry from buffer by version
- * Returns NULL if not found
- */
-static changelog_buffer_entry_t *changelog_buffer_get(uint64_t version) {
-    uint32_t index;
-    changelog_buffer_entry_t *entry;
-    
-    if (changelog_buffer == NULL || changelog_buffer_count == 0) {
-        return NULL;
-    }
-    
-    /* Check if version is in range */
-    if (version < changelog_buffer_first_version || 
-        version >= changelog_buffer_first_version + changelog_buffer_count) {
-        return NULL;
-    }
-    
-    /* Calculate index */
-    index = (changelog_buffer_head - changelog_buffer_count + 
-             (version - changelog_buffer_first_version)) % CHANGELOG_BUFFER_SIZE;
-    
-    entry = &changelog_buffer[index];
-    if (entry->version == version && entry->data != NULL) {
-        return entry;
-    }
-    
-    return NULL;
-}
-
-/*
- * Send missing changelogs to a peer that's behind
- * Called when we receive an ACK and detect the peer is behind
- */
-static void ha_resend_missing_changelogs(ha_peer_t *peer, uint64_t acked_version) {
-    uint64_t version;
-    uint64_t current_max;
-    changelog_buffer_entry_t *entry;
+static void ha_send_old_changelog(void *vpeer, uint64_t version, uint8_t *data, uint32_t length) {
+    ha_peer_t *peer = (ha_peer_t *)vpeer;
     uint8_t *payload;
     uint8_t *ptr;
     uint32_t payload_len;
-    int resent = 0;
-    
-    if (cluster->state != HA_STATE_LEADER) {
+
+    /* Build changelog entry message: version (8) + length (4) + data */
+    payload_len = 8 + 4 + length;
+    payload = malloc(payload_len);
+    if (payload == NULL) {
         return;
     }
-    
-    pthread_mutex_lock(&changelog_buffer_mutex);
-    current_max = changelog_buffer_first_version + changelog_buffer_count - 1;
-    pthread_mutex_unlock(&changelog_buffer_mutex);
-    
-    /* Resend up to 100 missing changelogs at once */
-    for (version = acked_version + 1; version <= current_max && resent < 100; version++) {
-        entry = changelog_buffer_get(version);
-        if (entry == NULL) {
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                    "HA: Cannot resend version %"PRIu64" - not in buffer", version);
-            break;
-        }
-        
-        /* Build and send changelog entry */
-        payload_len = 8 + 4 + entry->len;
-        payload = malloc(payload_len);
-        if (payload == NULL) {
-            break;
-        }
-        
-        ptr = payload;
-        put64bit(&ptr, version);
-        put32bit(&ptr, entry->len);
-        memcpy(ptr, entry->data, entry->len);
-        
-        if (ha_send_message(peer, HA_MSG_CHANGELOG_ENTRY, payload, payload_len) == 0) {
-            resent++;
-        }
-        
-        free(payload);
+
+    ptr = payload;
+    put64bit(&ptr, version);
+    put32bit(&ptr, length);
+    memcpy(ptr, data, length);
+
+    ha_send_message(peer, HA_MSG_CHANGELOG_ENTRY, payload, payload_len);
+
+    free(payload);
+}
+
+/*
+ * Send old changelogs to a peer that needs to catch up
+ * Uses changelog_get_old_changes() to read from changelog files
+ * Returns number of changelogs sent
+ */
+static uint32_t ha_catchup_peer(ha_peer_t *peer) {
+    uint32_t n;
+    uint64_t chlog_minversion;
+
+    if (cluster->state != HA_STATE_LEADER) {
+        return 0;
     }
-    
-    if (resent > 0) {
+
+    if (!peer->is_connected) {
+        return 0;
+    }
+
+    /* Get minimum version available in changelog files */
+    chlog_minversion = changelog_get_minversion();
+
+    /* If peer needs versions older than what we have, they need full sync */
+    if (chlog_minversion == 0 || (peer->next_log_version > 0 && chlog_minversion > peer->next_log_version)) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Peer %u needs version %"PRIu64" but min available is %"PRIu64" - needs full sync",
+                peer->id, peer->next_log_version, chlog_minversion);
+        peer->logstate = HA_LOGSTATE_NONE;
+        return 0;
+    }
+
+    /* Send batch of old changelogs */
+    n = changelog_get_old_changes(peer->next_log_version, ha_send_old_changelog, peer, HA_CHANGELOG_BATCH_SIZE);
+
+    if (n > 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                "HA: Resent %d changelogs to peer %u (versions %"PRIu64"-%"PRIu64")",
-                resent, peer->id, acked_version + 1, acked_version + resent);
+                "HA: Sent %u old changelogs to peer %u (from version %"PRIu64")",
+                n, peer->id, peer->next_log_version);
+        peer->next_log_version += n;
+    }
+
+    /* If we sent less than a full batch, peer is now caught up */
+    if (n < HA_CHANGELOG_BATCH_SIZE) {
+        peer->logstate = HA_LOGSTATE_SYNC;
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA: Peer %u is now SYNC (caught up to version %"PRIu64")",
+                peer->id, peer->next_log_version);
+    }
+
+    return n;
+}
+
+/*
+ * Initialize peer replication state when they connect/register
+ * Determines if peer needs catchup (DELAYED) or is ready (SYNC)
+ */
+static void ha_init_peer_replication(ha_peer_t *peer, uint64_t peer_version) {
+    uint64_t current_version;
+    uint64_t chlog_minversion;
+
+    current_version = meta_version();
+    chlog_minversion = changelog_get_minversion();
+
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+            "HA: Initializing replication for peer %u: peer_version=%"PRIu64", current=%"PRIu64", min_changelog=%"PRIu64,
+            peer->id, peer_version, current_version, chlog_minversion);
+
+    if (peer_version == 0 || peer_version >= current_version) {
+        /* Peer is up to date or new - direct to SYNC */
+        peer->logstate = HA_LOGSTATE_SYNC;
+        peer->next_log_version = current_version;
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA: Peer %u set to SYNC state", peer->id);
+    } else if (chlog_minversion > 0 && chlog_minversion <= peer_version) {
+        /* Peer is behind but we can catch them up from changelogs */
+        peer->logstate = HA_LOGSTATE_DELAYED;
+        peer->next_log_version = peer_version;
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA: Peer %u set to DELAYED state (needs catchup from %"PRIu64")",
+                peer->id, peer_version);
+        /* Start catchup immediately */
+        ha_catchup_peer(peer);
+    } else {
+        /* Peer is too far behind - needs full metadata sync */
+        peer->logstate = HA_LOGSTATE_NONE;
+        peer->next_log_version = 0;
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Peer %u needs full metadata sync (too far behind)", peer->id);
+    }
+}
+
+/*
+ * Process DELAYED peers - called periodically from main loop
+ * Continues sending old changelogs until peers are caught up
+ */
+static void ha_process_delayed_peers(void) {
+    uint32_t i;
+
+    if (cluster == NULL || cluster->state != HA_STATE_LEADER) {
+        return;
+    }
+
+    for (i = 0; i < cluster->peer_count; i++) {
+        ha_peer_t *peer = &cluster->peers[i];
+
+        if (peer->id != cluster->self_id &&
+            peer->is_connected &&
+            peer->logstate == HA_LOGSTATE_DELAYED) {
+            ha_catchup_peer(peer);
+        }
     }
 }
 
@@ -412,6 +392,28 @@ static int ha_broadcast_message(uint16_t type, const uint8_t *payload, uint32_t 
     return success_count;
 }
 
+/*
+ * Broadcast changelog only to peers in SYNC state (metalogger-style)
+ * DELAYED peers receive changelogs via ha_catchup_peer() instead
+ */
+static int ha_broadcast_changelog_to_sync_peers(const uint8_t *payload, uint32_t payload_len) {
+    uint32_t i;
+    int success_count = 0;
+
+    for (i = 0; i < cluster->peer_count; i++) {
+        ha_peer_t *peer = &cluster->peers[i];
+        if (peer->id != cluster->self_id &&
+            peer->is_connected &&
+            peer->logstate == HA_LOGSTATE_SYNC) {
+            if (ha_send_message(peer, HA_MSG_CHANGELOG_ENTRY, payload, payload_len) == 0) {
+                success_count++;
+            }
+        }
+    }
+
+    return success_count;
+}
+
 /* ============================================================================
  * Raft Core Functions
  * ============================================================================ */
@@ -484,6 +486,11 @@ static void ha_become_leader(void) {
         if (cluster->peers[i].id != cluster->self_id) {
             cluster->peers[i].next_index = cluster->last_log_index + 1;
             cluster->peers[i].match_index = 0;
+            /* Initialize replication state (metalogger-style) */
+            /* Start all peers as SYNC, ACK handler will switch to DELAYED if behind */
+            cluster->peers[i].logstate = HA_LOGSTATE_SYNC;
+            cluster->peers[i].next_log_version = meta_version();
+            cluster->peers[i].acked_version = 0;
         }
     }
 
@@ -868,29 +875,25 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
             ha_handle_changelog_entry(peer, payload, payload_len);
             break;
         case HA_MSG_CHANGELOG_ACK:
-            /* ACK received from follower - track version and resend missing */
+            /* ACK received from follower - track version (metalogger-style) */
             if (payload_len >= 8) {
                 const uint8_t *ack_ptr = payload;
                 uint64_t acked_version = get64bit(&ack_ptr);
-                uint64_t current_max = 0;
-                
+                uint64_t current_version = meta_version();
+
                 /* Update peer's acked version */
                 if (acked_version > peer->acked_version) {
                     peer->acked_version = acked_version;
                 }
-                
-                /* Check if peer is behind and resend missing changelogs */
-                pthread_mutex_lock(&changelog_buffer_mutex);
-                if (changelog_buffer_count > 0) {
-                    current_max = changelog_buffer_first_version + changelog_buffer_count - 1;
-                }
-                pthread_mutex_unlock(&changelog_buffer_mutex);
-                
-                if (current_max > 0 && acked_version < current_max) {
-                    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
-                            "HA: Peer %u acked %"PRIu64" but current is %"PRIu64", resending",
-                            peer->id, acked_version, current_max);
-                    ha_resend_missing_changelogs(peer, acked_version);
+
+                /* If peer is significantly behind, switch to DELAYED for catchup */
+                if (peer->logstate == HA_LOGSTATE_SYNC &&
+                    current_version > acked_version + 100) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                            "HA: Peer %u fell behind (acked %"PRIu64", current %"PRIu64") - switching to DELAYED",
+                            peer->id, acked_version, current_version);
+                    peer->logstate = HA_LOGSTATE_DELAYED;
+                    peer->next_log_version = acked_version + 1;
                 }
             }
             break;
@@ -1020,9 +1023,6 @@ int ha_init(void) {
             cluster->election_timeout_min_ms,
             cluster->election_timeout_max_ms);
 
-    /* Initialize changelog buffer for reliable replication */
-    changelog_buffer_init();
-
     /* Create listening socket */
     ha_lsock = tcpsocket();
     if (ha_lsock < 0) {
@@ -1088,6 +1088,7 @@ int ha_init(void) {
     /* Register with main event loop */
     main_poll_register(ha_desc, ha_serve);
     main_time_register(1, 0, ha_check_election_timeout);  /* Every 1 second */
+    main_time_register(1, 0, ha_process_delayed_peers);   /* Process DELAYED peers every 1 second */
     main_reload_register(ha_reload);
     main_destruct_register(ha_term);
 
@@ -1246,6 +1247,9 @@ int ha_add_peer(const char *host, uint16_t port) {
     peer->port = port;
     peer->sock = -1;
     peer->is_connected = 0;
+    peer->logstate = HA_LOGSTATE_NONE;  /* Will be set when peer registers */
+    peer->next_log_version = 0;
+    peer->acked_version = 0;
     strncpy(peer->hostname, host, sizeof(peer->hostname) - 1);
 
     cluster->peer_count++;
@@ -1274,9 +1278,6 @@ int ha_replicate_changelog(uint64_t version, const uint8_t *data, uint32_t len) 
         return -1;  /* Only leader can replicate */
     }
 
-    /* Store in buffer for potential retry */
-    changelog_buffer_add(version, data, len);
-
     /* Build changelog entry message */
     payload_len = 8 + 4 + len;  /* version + data_len + data */
     payload = malloc(payload_len);
@@ -1289,8 +1290,9 @@ int ha_replicate_changelog(uint64_t version, const uint8_t *data, uint32_t len) 
     put32bit(&ptr, len);
     memcpy(ptr, data, len);
 
-    /* Broadcast to all followers */
-    result = ha_broadcast_message(HA_MSG_CHANGELOG_ENTRY, payload, payload_len);
+    /* Broadcast only to SYNC peers (metalogger-style) */
+    /* DELAYED peers receive changelogs via ha_catchup_peer() */
+    result = ha_broadcast_changelog_to_sync_peers(payload, payload_len);
 
     free(payload);
 
@@ -1699,6 +1701,14 @@ void ha_serve(struct pollfd *pdesc) {
                     }
                     cluster->peers[i].sock = ns;
                     cluster->peers[i].is_connected = 1;
+                    /* Initialize replication state - assume in sync, will catch up if needed */
+                    if (cluster->state == HA_STATE_LEADER) {
+                        cluster->peers[i].logstate = HA_LOGSTATE_SYNC;
+                        cluster->peers[i].next_log_version = meta_version();
+                        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                                "HA: Peer %u connected, set to SYNC (version %"PRIu64")",
+                                cluster->peers[i].id, cluster->peers[i].next_log_version);
+                    }
                     mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
                             "HA: Accepted connection from peer %u", cluster->peers[i].id);
                     break;

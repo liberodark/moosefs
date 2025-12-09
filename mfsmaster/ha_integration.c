@@ -762,8 +762,8 @@ static void apply_buffered_changelogs(void) {
                     fflush(changelog_fd);
                 }
 
-                /* Apply to memory */
-                result = restore_net(entry->version, changelog_line, &ts);
+                /* Apply to memory - restore_net expects current_version (before applying) */
+                result = restore_net(current_version, changelog_line, &ts);
                 if (result == 0) {
                     current_version = entry->version;
                     applied++;
@@ -871,6 +871,9 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
     /*
      * STEP 2: Apply to memory using restore_net()
      * This is the key difference from metalogger - we apply LIVE
+     * NOTE: restore_net() expects the version BEFORE applying (current_version),
+     * not the version of the changelog being applied (version).
+     * It will verify: lv == meta_version() before, and lv+1 == meta_version() after.
      */
     result = restore_net(current_version, changelog_line, &ts);
 

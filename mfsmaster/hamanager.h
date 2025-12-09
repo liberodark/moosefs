@@ -35,7 +35,6 @@
 #define HA_HEARTBEAT_MS         150         /* Heartbeat interval in milliseconds */
 #define HA_ELECTION_TIMEOUT_MIN 1500        /* Minimum election timeout (ms) */
 #define HA_ELECTION_TIMEOUT_MAX 3000        /* Maximum election timeout (ms) */
-#define HA_CHANGELOG_BATCH_SIZE 1000        /* Max changelog entries per sync */
 #define HA_SYNC_TIMEOUT_MS      5000        /* Sync timeout in milliseconds */
 #define HA_META_DL_BLOCK        1000000     /* Metadata download block size (1MB, like metalogger) */
 
@@ -111,9 +110,19 @@ typedef struct ha_peer {
     /* Sync state for chunked transfer */
     char        sync_path[PATH_MAX];        /* Path to metadata file being synced */
     uint64_t    sync_filesize;              /* Size of file being synced */
-    /* Changelog replication tracking */
+    /* Changelog replication tracking (metalogger-style) */
+    uint8_t     logstate;                   /* NONE=0, DELAYED=1, SYNC=2 */
+    uint64_t    next_log_version;           /* Next changelog version to send (for DELAYED) */
     uint64_t    acked_version;              /* Last changelog version ACKed by this peer */
 } ha_peer_t;
+
+/* Peer log states (metalogger-style) */
+#define HA_LOGSTATE_NONE    0               /* Not yet registered */
+#define HA_LOGSTATE_DELAYED 1               /* Catching up (receiving old changelogs) */
+#define HA_LOGSTATE_SYNC    2               /* In sync (receiving live changelogs) */
+
+/* Number of changelogs to send per batch during catchup */
+#define HA_CHANGELOG_BATCH_SIZE 10000
 
 /* Changelog entry for replication */
 typedef struct ha_log_entry {
