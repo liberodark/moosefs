@@ -67,6 +67,7 @@ struct {
 	{multilan_init,"multilan map"},
 	{ha_init,"high availability manager"},
 	{ha_integration_init,"HA integration module"},
+	{ha_pre_metadata_sync,"HA pre-metadata sync"},  /* Sync metadata from peers if needed BEFORE loading */
 	{changelog_init,"change log"},
 	{missing_log_init,"missing chunks/files log"}, // has to be before 'fs_init'
 	{dcm_init,"data cache manager"}, // has to be before 'fs_init' and 'matoclserv_init'

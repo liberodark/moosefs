@@ -25,6 +25,13 @@ int ha_integration_init(void);
 void ha_integration_term(void);
 
 /*
+ * Pre-metadata synchronization
+ * Called BEFORE meta_init() to ensure metadata is available from peers
+ * Returns 0 on success (metadata ready), -1 on failure
+ */
+int ha_pre_metadata_sync(void);
+
+/*
  * Check if HA is enabled
  */
 int ha_is_enabled(void);

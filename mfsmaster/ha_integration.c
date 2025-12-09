@@ -18,6 +18,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <netinet/in.h>
+#include <limits.h>
 
 #include "ha_integration.h"
 #include "hamanager.h"
@@ -31,6 +33,8 @@
 #include "clocks.h"
 #include "datapack.h"
 #include "restore.h"
+#include "sockets.h"
+#include "MFSCommunication.h"
 
 /* External MooseFS functions for changelog handling */
 extern uint64_t meta_version(void);
@@ -56,7 +60,6 @@ static char *data_path_cache = NULL;
 
 /* Changelog file for persistence (like metalogger) */
 static FILE *changelog_fd = NULL;
-static uint32_t changelog_file_version = 0;
 
 /* Changelog buffer for when sync is in progress */
 #define CHANGELOG_BUFFER_SIZE 1000
@@ -69,6 +72,311 @@ typedef struct {
 static changelog_entry_t changelog_buffer[CHANGELOG_BUFFER_SIZE];
 static uint32_t changelog_buffer_head = 0;
 static uint32_t changelog_buffer_tail = 0;
+
+/* ============================================================================
+ * Pre-metadata Sync (called BEFORE meta_init)
+ * ============================================================================ */
+
+/*
+ * Check if metadata file exists and is valid
+ */
+static int metadata_file_exists(const char *data_path) {
+    char path[PATH_MAX];
+    struct stat st;
+    
+    snprintf(path, sizeof(path), "%s/metadata.mfs", data_path);
+    if (stat(path, &st) == 0 && st.st_size > 100) {
+        return 1;
+    }
+    
+    snprintf(path, sizeof(path), "%s/metadata.mfs.back", data_path);
+    if (stat(path, &st) == 0 && st.st_size > 100) {
+        return 1;
+    }
+    
+    return 0;
+}
+
+/*
+ * Download metadata from a peer synchronously
+ * Returns 0 on success, -1 on failure
+ */
+static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *data_path) {
+    int sock;
+    uint8_t hdr[8];
+    uint8_t *buf;
+    uint32_t cmd, size;
+    const uint8_t *rptr;
+    uint8_t *wptr;
+    char path[PATH_MAX];
+    char temp_path[PATH_MAX];
+    int fd;
+    uint64_t file_size, offset;
+    ssize_t written;
+    
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+            "HA Pre-sync: Connecting to peer %u.%u.%u.%u:%u",
+            (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, port);
+    
+    /* Connect to peer */
+    sock = tcpsocket();
+    if (sock < 0) {
+        return -1;
+    }
+    
+    if (tcpnumconnect(sock, ip, port) < 0) {
+        tcpclose(sock);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA Pre-sync: Failed to connect to peer");
+        return -1;
+    }
+    
+    tcpnodelay(sock);
+    
+    /* Send sync request using HA protocol */
+    buf = malloc(32);
+    if (!buf) {
+        tcpclose(sock);
+        return -1;
+    }
+    
+    wptr = buf;
+    put32bit(&wptr, HA_MSG_SYNC_REQUEST);  /* Message type */
+    put32bit(&wptr, 16);                    /* Payload size */
+    put64bit(&wptr, 0);                     /* Our version (0 = need full sync) */
+    put64bit(&wptr, 0);                     /* Checksum */
+    
+    if (tcptowrite(sock, buf, 24, 1000, 5000) != 24) {
+        free(buf);
+        tcpclose(sock);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA Pre-sync: Failed to send sync request");
+        return -1;
+    }
+    
+    /* Read response header */
+    if (tcptoread(sock, hdr, 8, 1000, 30000) != 8) {
+        free(buf);
+        tcpclose(sock);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA Pre-sync: Failed to read response header");
+        return -1;
+    }
+    
+    rptr = hdr;
+    cmd = get32bit(&rptr);
+    size = get32bit(&rptr);
+    
+    if (cmd != HA_MSG_SYNC_RESPONSE) {
+        free(buf);
+        tcpclose(sock);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA Pre-sync: Unexpected response type %u", cmd);
+        return -1;
+    }
+    
+    /* Read response payload */
+    free(buf);
+    buf = malloc(size);
+    if (!buf) {
+        tcpclose(sock);
+        return -1;
+    }
+    
+    if (tcptoread(sock, buf, size, 1000, 60000) != (ssize_t)size) {
+        free(buf);
+        tcpclose(sock);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA Pre-sync: Failed to read response payload");
+        return -1;
+    }
+    
+    tcpclose(sock);
+    
+    /* Parse response: version (8) + size (4) + data */
+    if (size < 12) {
+        free(buf);
+        return -1;
+    }
+    
+    rptr = buf;
+    /* uint64_t version = */ get64bit(&rptr);
+    file_size = get32bit(&rptr);
+    
+    if (size != 12 + file_size) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA Pre-sync: Size mismatch %u vs expected %lu", size, 12 + file_size);
+        free(buf);
+        return -1;
+    }
+    
+    /* Write metadata to temp file */
+    snprintf(temp_path, sizeof(temp_path), "%s/metadata.mfs.ha_sync", data_path);
+    snprintf(path, sizeof(path), "%s/metadata.mfs.back", data_path);
+    
+    fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(buf);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA Pre-sync: Failed to create temp file: %s", strerror(errno));
+        return -1;
+    }
+    
+    offset = 0;
+    while (offset < file_size) {
+        written = write(fd, buf + 12 + offset, file_size - offset);
+        if (written <= 0) {
+            close(fd);
+            unlink(temp_path);
+            free(buf);
+            return -1;
+        }
+        offset += written;
+    }
+    
+    if (fsync(fd) < 0) {
+        close(fd);
+        unlink(temp_path);
+        free(buf);
+        return -1;
+    }
+    close(fd);
+    
+    /* Rename to final location */
+    if (rename(temp_path, path) < 0) {
+        unlink(temp_path);
+        free(buf);
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA Pre-sync: Failed to rename metadata file");
+        return -1;
+    }
+    
+    free(buf);
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA Pre-sync: Successfully downloaded metadata (%lu bytes)", file_size);
+    
+    return 0;
+}
+
+/*
+ * Parse peers from config string "ip1:port1,ip2:port2,..."
+ */
+static int parse_and_try_peers(const char *peers_str, const char *data_path) {
+    char *peers_copy;
+    char *peer, *saveptr;
+    char *host, *port_str;
+    uint32_t ip;
+    uint16_t port;
+    
+    if (!peers_str || !peers_str[0]) {
+        return -1;
+    }
+    
+    peers_copy = strdup(peers_str);
+    if (!peers_copy) {
+        return -1;
+    }
+    
+    peer = strtok_r(peers_copy, ",", &saveptr);
+    while (peer) {
+        /* Skip whitespace */
+        while (*peer == ' ') peer++;
+        
+        host = peer;
+        port_str = strchr(peer, ':');
+        if (port_str) {
+            *port_str = '\0';
+            port_str++;
+            port = atoi(port_str);
+        } else {
+            port = 9418;  /* Default HA port */
+        }
+        
+        /* Resolve hostname */
+        if (tcpresolve(host, NULL, &ip, NULL, 0) >= 0) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                    "HA Pre-sync: Trying peer %s:%u", host, port);
+            
+            if (download_metadata_from_peer(ip, port, data_path) == 0) {
+                free(peers_copy);
+                return 0;  /* Success! */
+            }
+        }
+        
+        peer = strtok_r(NULL, ",", &saveptr);
+    }
+    
+    free(peers_copy);
+    return -1;
+}
+
+/*
+ * Pre-metadata synchronization
+ * Called BEFORE meta_init() to ensure metadata is available
+ * Returns 0 on success (metadata ready), -1 on failure
+ */
+int ha_pre_metadata_sync(void) {
+    uint8_t ha_enabled_cfg;
+    char *data_path;
+    char *peers_str;
+    int result = 0;
+    int retry;
+    
+    /* Check if HA is enabled */
+    ha_enabled_cfg = cfg_getuint8("HA_ENABLED", 0);
+    if (!ha_enabled_cfg) {
+        /* HA disabled, nothing to do */
+        return 0;
+    }
+    
+    /* Get data path */
+    data_path = cfg_getstr("DATA_PATH", "/var/lib/mfs");
+    
+    /* Check if metadata already exists */
+    if (metadata_file_exists(data_path)) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                "HA Pre-sync: Metadata file exists, skipping sync");
+        free(data_path);
+        return 0;
+    }
+    
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA Pre-sync: No metadata found, will sync from peers");
+    
+    /* Get peers from config */
+    peers_str = cfg_getstr("HA_PEERS", NULL);
+    if (!peers_str || !peers_str[0]) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA Pre-sync: No peers configured (HA_PEERS)");
+        free(data_path);
+        return -1;
+    }
+    
+    /* Try to sync from peers with retries */
+    for (retry = 0; retry < 5; retry++) {
+        if (retry > 0) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                    "HA Pre-sync: Retry %d/5...", retry + 1);
+            sleep(2);
+        }
+        
+        if (parse_and_try_peers(peers_str, data_path) == 0) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                    "HA Pre-sync: Metadata synchronized successfully");
+            result = 0;
+            goto cleanup;
+        }
+    }
+    
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+            "HA Pre-sync: Failed to sync metadata from any peer after 5 retries");
+    result = -1;
+    
+cleanup:
+    free(data_path);
+    free(peers_str);
+    return result;
+}
 
 /* ============================================================================
  * Callbacks from HA module
