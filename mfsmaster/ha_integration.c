@@ -1030,6 +1030,18 @@ int ha_should_replicate(void) {
     return is_leader;
 }
 
+/*
+ * Check if this master is a HA follower (HA enabled but not leader)
+ * Used by changelog.c to skip local changelog generation on followers
+ * Returns: 1 if follower, 0 if leader or HA disabled
+ */
+int ha_is_follower(void) {
+    if (!ha_enabled) {
+        return 0;  /* No HA, not a follower */
+    }
+    return !ha_is_leader();
+}
+
 int ha_replicate_changelog_entry(uint64_t version, const uint8_t *data, uint32_t len) {
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA: ha_replicate_changelog_entry called: version=%lu, len=%u",

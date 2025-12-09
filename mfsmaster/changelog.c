@@ -245,6 +245,16 @@ void changelog(const char *format,...) {
 	uint32_t leng;
 	uint64_t version;
 
+	/*
+	 * HA Integration: Only the leader should generate changelogs.
+	 * Followers receive changelogs from the leader and apply them via restore_net().
+	 * Skip changelog generation if we're a follower (HA enabled but not leader).
+	 * Note: ha_is_follower() returns 1 only if HA is enabled AND we're not the leader.
+	 */
+	if (ha_is_follower()) {
+		/* We're a HA follower - don't generate local changelogs */
+		return;
+	}
 
 	va_start(ap,format);
 	leng = vsnprintf(printbuff,MAXLOGLINESIZE,format,ap);

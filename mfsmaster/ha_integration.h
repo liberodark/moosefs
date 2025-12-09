@@ -47,6 +47,7 @@ int ha_can_accept_write(void);
  * Returns: 1 if we're leader and have followers, 0 otherwise
  */
 int ha_should_replicate(void);
+int ha_is_follower(void);
 
 /*
  * Replicate a changelog entry to followers
