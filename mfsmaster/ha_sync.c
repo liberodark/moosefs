@@ -247,6 +247,19 @@ void ha_sync_set_complete_callback(ha_sync_complete_callback_t cb) {
     sync_complete_cb = cb;
 }
 
+void ha_sync_mark_complete(void) {
+    pthread_mutex_lock(&sync_mutex);
+    sync_ctx.state = HA_SYNC_STATE_COMPLETE;
+    pthread_mutex_unlock(&sync_mutex);
+    
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA Sync: Marked as complete");
+    
+    if (sync_complete_cb != NULL) {
+        sync_complete_cb(1);  /* 1 = success */
+    }
+}
+
 /* ============================================================================
  * Follower-side: Request Sync
  * ============================================================================ */

@@ -158,4 +158,7 @@ int ha_sync_send_next_chunk(uint32_t peer_id);
 typedef void (*ha_sync_complete_callback_t)(int success);
 void ha_sync_set_complete_callback(ha_sync_complete_callback_t cb);
 
+/* Mark sync as complete (called from hamanager.c when sync response is processed) */
+void ha_sync_mark_complete(void);
+
 #endif /* _HA_SYNC_H_ */

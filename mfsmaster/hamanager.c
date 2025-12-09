@@ -708,6 +708,11 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
         case HA_MSG_SYNC_RESPONSE:
             ha_handle_sync_response(peer, payload, payload_len);
             break;
+        case HA_MSG_CHANGELOG_ACK:
+            /* ACK from follower acknowledging changelog receipt - no action needed */
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                    "HA: Received changelog ACK from peer %u", peer->id);
+            break;
         case HA_MSG_PING:
             ha_send_message(peer, HA_MSG_PONG, NULL, 0);
             break;
@@ -1326,8 +1331,9 @@ static void ha_handle_sync_response(ha_peer_t *peer, const uint8_t *data, uint32
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA: Metadata file synced successfully (version=%lu)", leader_version);
 
-    /* Mark sync as complete */
+    /* Mark sync as complete in both hamanager and ha_sync */
     cluster->sync_in_progress = 0;
+    ha_sync_mark_complete();
 
     /* Notify integration layer to reload metadata */
     if (on_sync_complete != NULL) {
