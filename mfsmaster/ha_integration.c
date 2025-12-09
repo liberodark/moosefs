@@ -86,7 +86,7 @@ static int metadata_file_exists(const char *data_path) {
     struct stat st;
     int fd;
     char header[8];
-    
+
     /* Check metadata.mfs */
     snprintf(path, sizeof(path), "%s/metadata.mfs", data_path);
     if (stat(path, &st) == 0 && st.st_size > 1000) {
@@ -95,7 +95,7 @@ static int metadata_file_exists(const char *data_path) {
             if (read(fd, header, 8) == 8) {
                 close(fd);
                 /* Check for valid signature, not "MFSM NEW" */
-                if (memcmp(header, "MFSM ", 5) == 0 && 
+                if (memcmp(header, "MFSM ", 5) == 0 &&
                     memcmp(header, "MFSM NEW", 8) != 0) {
                     return 1;
                 }
@@ -104,7 +104,7 @@ static int metadata_file_exists(const char *data_path) {
             }
         }
     }
-    
+
     /* Check metadata.mfs.back */
     snprintf(path, sizeof(path), "%s/metadata.mfs.back", data_path);
     if (stat(path, &st) == 0 && st.st_size > 1000) {
@@ -113,7 +113,7 @@ static int metadata_file_exists(const char *data_path) {
             if (read(fd, header, 8) == 8) {
                 close(fd);
                 /* Check for valid signature, not "MFSM NEW" */
-                if (memcmp(header, "MFSM ", 5) == 0 && 
+                if (memcmp(header, "MFSM ", 5) == 0 &&
                     memcmp(header, "MFSM NEW", 8) != 0) {
                     return 1;
                 }
@@ -122,7 +122,7 @@ static int metadata_file_exists(const char *data_path) {
             }
         }
     }
-    
+
     return 0;
 }
 
@@ -134,26 +134,26 @@ static int metadata_check(const char *name) {
     int fd;
     char chkbuff[16];
     char eofmark[16];
-    
+
     fd = open(name, O_RDONLY);
     if (fd < 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, "HA: Can't open downloaded metadata");
         return -1;
     }
-    
+
     if (read(fd, chkbuff, 8) != 8) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, "HA: Can't read downloaded metadata");
         close(fd);
         return -1;
     }
-    
+
     if (memcmp(chkbuff, "MFSM NEW", 8) == 0) {
         close(fd);
         return -1;  /* Empty metadata */
     }
-    
+
     /* Check signature "MFSM x.y" */
-    if (memcmp(chkbuff, "MFSM ", 5) == 0 && chkbuff[5] >= '1' && chkbuff[5] <= '9' 
+    if (memcmp(chkbuff, "MFSM ", 5) == 0 && chkbuff[5] >= '1' && chkbuff[5] <= '9'
         && chkbuff[6] == '.' && chkbuff[7] >= '0' && chkbuff[7] <= '9') {
         uint8_t fver = ((chkbuff[5] - '0') << 4) + (chkbuff[7] - '0');
         if (fver < 0x17) {
@@ -166,7 +166,7 @@ static int metadata_check(const char *name) {
         close(fd);
         return -1;
     }
-    
+
     /* Check EOF marker */
     lseek(fd, -16, SEEK_END);
     if (read(fd, chkbuff, 16) != 16) {
@@ -175,12 +175,12 @@ static int metadata_check(const char *name) {
         return -1;
     }
     close(fd);
-    
+
     if (memcmp(chkbuff, eofmark, 16) != 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, "HA: Truncated metadata file!");
         return -1;
     }
-    
+
     return 0;
 }
 
@@ -189,7 +189,7 @@ static int metadata_check(const char *name) {
  */
 static int send_ha_message(int sock, uint16_t type, const uint8_t *payload, uint32_t len) {
     ha_msg_header_t header;
-    
+
     header.magic = HA_MSG_MAGIC;
     header.type = type;
     header.version = HA_PROTOCOL_VER;
@@ -197,17 +197,17 @@ static int send_ha_message(int sock, uint16_t type, const uint8_t *payload, uint
     header.term = 0;       /* Not used for sync */
     header.length = len;
     header.crc32 = (len > 0 && payload != NULL) ? mycrc32(0, payload, len) : 0;
-    
+
     if (tcptowrite(sock, &header, sizeof(header), 1000, 5000) != sizeof(header)) {
         return -1;
     }
-    
+
     if (len > 0 && payload != NULL) {
         if (tcptowrite(sock, payload, len, 1000, 30000) != (ssize_t)len) {
             return -1;
         }
     }
-    
+
     return 0;
 }
 
@@ -217,34 +217,34 @@ static int send_ha_message(int sock, uint16_t type, const uint8_t *payload, uint
 static int recv_ha_message(int sock, uint16_t *type, uint8_t **payload, uint32_t *len, uint32_t timeout_ms) {
     ha_msg_header_t header;
     uint32_t calc_crc;
-    
+
     if (tcptoread(sock, &header, sizeof(header), 1000, timeout_ms) != sizeof(header)) {
         return -1;
     }
-    
+
     if (header.magic != HA_MSG_MAGIC) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, "HA: Bad magic in response");
         return -1;
     }
-    
+
     *type = header.type;
     *len = header.length;
-    
+
     if (header.length > 0) {
         *payload = malloc(header.length);
         if (*payload == NULL) {
             return -1;
         }
-        
+
         if (tcptoread(sock, *payload, header.length, 1000, timeout_ms) != (ssize_t)header.length) {
             free(*payload);
             *payload = NULL;
             return -1;
         }
-        
+
         calc_crc = mycrc32(0, *payload, header.length);
         if (calc_crc != header.crc32) {
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING, 
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
                     "HA: Message CRC mismatch (got 0x%08X, expected 0x%08X)", calc_crc, header.crc32);
             free(*payload);
             *payload = NULL;
@@ -253,7 +253,7 @@ static int recv_ha_message(int sock, uint16_t *type, uint8_t **payload, uint32_t
     } else {
         *payload = NULL;
     }
-    
+
     return 0;
 }
 
@@ -278,38 +278,38 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
     uint64_t chunk_offset;
     int retry_count;
     int result = -1;
-    
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
             "HA Pre-sync: Connecting to peer %u.%u.%u.%u:%u",
             (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, port);
-    
+
     /* Connect to peer */
     sock = tcpsocket();
     if (sock < 0) {
         return -1;
     }
-    
+
     if (tcpnumconnect(sock, ip, port) < 0) {
         tcpclose(sock);
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
                 "HA Pre-sync: Failed to connect to peer");
         return -1;
     }
-    
+
     tcpnodelay(sock);
-    
+
     /* Send sync request */
     wptr = request;
     put64bit(&wptr, 0);  /* Our version (0 = need full sync) */
     put64bit(&wptr, 0);  /* Checksum */
-    
+
     if (send_ha_message(sock, HA_MSG_SYNC_REQUEST, request, 16) < 0) {
         tcpclose(sock);
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
                 "HA Pre-sync: Failed to send sync request");
         return -1;
     }
-    
+
     /* Receive SYNC_INFO with file size */
     if (recv_ha_message(sock, &msg_type, &payload, &msg_len, 30000) < 0) {
         tcpclose(sock);
@@ -317,7 +317,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
                 "HA Pre-sync: Failed to receive sync info");
         return -1;
     }
-    
+
     if (msg_type != HA_MSG_SYNC_INFO || msg_len < 16) {
         free(payload);
         tcpclose(sock);
@@ -325,21 +325,21 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
                 "HA Pre-sync: Unexpected response type %u", msg_type);
         return -1;
     }
-    
+
     rptr = payload;
     leader_version = get64bit(&rptr);
     file_size = get64bit(&rptr);
     free(payload);
     payload = NULL;
-    
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Pre-sync: Leader version=%"PRIu64", file size=%"PRIu64,
             leader_version, file_size);
-    
+
     /* Open temp file */
     snprintf(temp_path, sizeof(temp_path), "%s/metadata.mfs.ha_sync", data_path);
     snprintf(path, sizeof(path), "%s/metadata.mfs.back", data_path);
-    
+
     fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         tcpclose(sock);
@@ -347,22 +347,22 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
                 "HA Pre-sync: Failed to create temp file: %s", strerror(errno));
         return -1;
     }
-    
+
     /* Download chunks */
     offset = 0;
     retry_count = 0;
-    
+
     while (offset < file_size) {
         chunk_size = HA_META_DL_BLOCK;
         if (file_size - offset < chunk_size) {
             chunk_size = file_size - offset;
         }
-        
+
         /* Request chunk */
         wptr = request;
         put64bit(&wptr, offset);
         put32bit(&wptr, chunk_size);
-        
+
         if (send_ha_message(sock, HA_MSG_SYNC_CHUNK_REQUEST, request, 12) < 0) {
             mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
                     "HA Pre-sync: Failed to request chunk at offset %"PRIu64, offset);
@@ -371,7 +371,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             }
             continue;
         }
-        
+
         /* Receive chunk */
         if (recv_ha_message(sock, &msg_type, &payload, &msg_len, 60000) < 0) {
             mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
@@ -381,7 +381,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             }
             continue;
         }
-        
+
         if (msg_type != HA_MSG_SYNC_CHUNK_DATA || msg_len < 16) {
             free(payload);
             payload = NULL;
@@ -392,13 +392,13 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             }
             continue;
         }
-        
+
         /* Parse chunk: offset(8) + size(4) + crc(4) + data */
         rptr = payload;
         chunk_offset = get64bit(&rptr);
         chunk_size = get32bit(&rptr);
         crc = get32bit(&rptr);
-        
+
         if (msg_len != 16 + chunk_size) {
             free(payload);
             payload = NULL;
@@ -409,7 +409,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             }
             continue;
         }
-        
+
         if (chunk_offset != offset) {
             free(payload);
             payload = NULL;
@@ -421,7 +421,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             }
             continue;
         }
-        
+
         /* Verify CRC */
         calc_crc = mycrc32(0, payload + 16, chunk_size);
         if (calc_crc != crc) {
@@ -435,7 +435,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             }
             continue;
         }
-        
+
         /* Write chunk */
         if (pwrite(fd, payload + 16, chunk_size, offset) != (ssize_t)chunk_size) {
             free(payload);
@@ -447,7 +447,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             }
             continue;
         }
-        
+
         /* fsync after each chunk (like metalogger) */
         if (fsync(fd) < 0) {
             free(payload);
@@ -459,23 +459,23 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             }
             continue;
         }
-        
+
         free(payload);
         payload = NULL;
-        
+
         offset += chunk_size;
         retry_count = 0;  /* Reset retry counter on success */
-        
+
         mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
                 "HA Pre-sync: Downloaded %"PRIu64"/%"PRIu64" bytes (%.1f%%)",
                 offset, file_size, (100.0 * offset) / file_size);
     }
-    
+
     close(fd);
     fd = -1;
     tcpclose(sock);
     sock = -1;
-    
+
     /* Verify metadata file */
     if (metadata_check(temp_path) < 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
@@ -483,7 +483,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
         unlink(temp_path);
         return -1;
     }
-    
+
     /* Rename to final location */
     if (rename(temp_path, path) < 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
@@ -491,13 +491,13 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
         unlink(temp_path);
         return -1;
     }
-    
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Pre-sync: Successfully downloaded and verified metadata (%"PRIu64" bytes)",
             file_size);
-    
+
     return 0;
-    
+
 cleanup:
     if (payload) free(payload);
     if (fd >= 0) close(fd);
@@ -515,21 +515,21 @@ static int parse_and_try_peers(const char *peers_str, const char *data_path) {
     char *host, *port_str;
     uint32_t ip;
     uint16_t port;
-    
+
     if (!peers_str || !peers_str[0]) {
         return -1;
     }
-    
+
     peers_copy = strdup(peers_str);
     if (!peers_copy) {
         return -1;
     }
-    
+
     peer = strtok_r(peers_copy, ",", &saveptr);
     while (peer) {
         /* Skip whitespace */
         while (*peer == ' ') peer++;
-        
+
         host = peer;
         port_str = strchr(peer, ':');
         if (port_str) {
@@ -539,21 +539,21 @@ static int parse_and_try_peers(const char *peers_str, const char *data_path) {
         } else {
             port = 9418;  /* Default HA port */
         }
-        
+
         /* Resolve hostname */
         if (tcpresolve(host, NULL, &ip, NULL, 0) >= 0) {
             mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
                     "HA Pre-sync: Trying peer %s:%u", host, port);
-            
+
             if (download_metadata_from_peer(ip, port, data_path) == 0) {
                 free(peers_copy);
                 return 0;  /* Success! */
             }
         }
-        
+
         peer = strtok_r(NULL, ",", &saveptr);
     }
-    
+
     free(peers_copy);
     return -1;
 }
@@ -569,17 +569,17 @@ int ha_pre_metadata_sync(void) {
     char *peers_str;
     int result = 0;
     int retry;
-    
+
     /* Check if HA is enabled */
     ha_enabled_cfg = cfg_getuint8("HA_ENABLED", 0);
     if (!ha_enabled_cfg) {
         /* HA disabled, nothing to do */
         return 0;
     }
-    
+
     /* Get data path */
     data_path = cfg_getstr("DATA_PATH", "/var/lib/mfs");
-    
+
     /* Check if metadata already exists */
     if (metadata_file_exists(data_path)) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
@@ -587,10 +587,10 @@ int ha_pre_metadata_sync(void) {
         free(data_path);
         return 0;
     }
-    
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Pre-sync: No metadata found, will sync from peers");
-    
+
     /* Get peers from config */
     peers_str = cfg_getstr("HA_PEERS", NULL);
     if (!peers_str || !peers_str[0]) {
@@ -599,7 +599,7 @@ int ha_pre_metadata_sync(void) {
         free(data_path);
         return -1;
     }
-    
+
     /* Try to sync from peers with retries */
     for (retry = 0; retry < 5; retry++) {
         if (retry > 0) {
@@ -607,7 +607,7 @@ int ha_pre_metadata_sync(void) {
                     "HA Pre-sync: Retry %d/5...", retry + 1);
             sleep(2);
         }
-        
+
         if (parse_and_try_peers(peers_str, data_path) == 0) {
             mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                     "HA Pre-sync: Metadata synchronized successfully");
@@ -615,11 +615,11 @@ int ha_pre_metadata_sync(void) {
             goto cleanup;
         }
     }
-    
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
             "HA Pre-sync: Failed to sync metadata from any peer after 5 retries");
     result = -1;
-    
+
 cleanup:
     free(data_path);
     free(peers_str);
@@ -755,13 +755,13 @@ static void apply_buffered_changelogs(void) {
                 changelog_line[entry->len] = '\0';
 
                 pthread_mutex_unlock(&ha_int_mutex);
-                
+
                 /* Write to disk */
                 if (changelog_fd != NULL) {
                     fprintf(changelog_fd, "%"PRIu64": %s\n", entry->version, changelog_line);
                     fflush(changelog_fd);
                 }
-                
+
                 /* Apply to memory */
                 result = restore_net(entry->version, changelog_line, &ts);
                 if (result == 0) {
@@ -772,7 +772,7 @@ static void apply_buffered_changelogs(void) {
                             "HA Integration: Failed to apply buffered changelog %lu",
                             entry->version);
                 }
-                
+
                 pthread_mutex_lock(&ha_int_mutex);
 
                 free(changelog_line);
@@ -854,7 +854,7 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
      */
     if (changelog_fd == NULL) {
         char path[256];
-        snprintf(path, sizeof(path), "%s/changelog_ha.0.mfs", 
+        snprintf(path, sizeof(path), "%s/changelog_ha.0.mfs",
                  data_path_cache ? data_path_cache : "/var/lib/mfs");
         changelog_fd = fopen(path, "a");
         if (changelog_fd == NULL) {
@@ -862,7 +862,7 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
                     "HA Integration: Cannot open changelog file for writing");
         }
     }
-    
+
     if (changelog_fd != NULL) {
         fprintf(changelog_fd, "%"PRIu64": %s\n", version, changelog_line);
         fflush(changelog_fd);
@@ -872,7 +872,7 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
      * STEP 2: Apply to memory using restore_net()
      * This is the key difference from metalogger - we apply LIVE
      */
-    result = restore_net(version, changelog_line, &ts);
+    result = restore_net(current_version, changelog_line, &ts);
 
     if (result == 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
@@ -987,13 +987,13 @@ void ha_integration_term(void) {
         fclose(changelog_fd);
         changelog_fd = NULL;
     }
-    
+
     /* Free data path cache */
     if (data_path_cache != NULL) {
         free(data_path_cache);
         data_path_cache = NULL;
     }
-    
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
             "HA Integration: Terminated");
 }
