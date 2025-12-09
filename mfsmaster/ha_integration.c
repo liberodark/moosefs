@@ -466,7 +466,7 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
         offset += chunk_size;
         retry_count = 0;  /* Reset retry counter on success */
 
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA Pre-sync: Downloaded %"PRIu64"/%"PRIu64" bytes (%.1f%%)",
                 offset, file_size, (100.0 * offset) / file_size);
     }
@@ -806,12 +806,12 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
     uint32_t ts;
     int result;
 
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Integration: Received changelog version %lu, len=%u", version, len);
 
     /* If sync is in progress, buffer the changelog for later */
     if (ha_sync_is_in_progress()) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA Integration: Sync in progress, buffering changelog %lu", version);
         buffer_changelog(version, data, len);
         return;
@@ -822,7 +822,7 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
 
     /* Version check - we should receive changelogs in order */
     if (version <= current_version) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA Integration: Ignoring old changelog version %lu (current=%lu)",
                 version, current_version);
         return;
@@ -878,7 +878,7 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
     result = restore_net(current_version, changelog_line, &ts);
 
     if (result == 0) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA Integration: Applied changelog %lu to memory (ts=%u)", version, ts);
     } else {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
@@ -1017,7 +1017,7 @@ int ha_should_replicate(void) {
     int is_leader;
 
     if (!ha_enabled) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA: ha_should_replicate: HA not enabled");
         return 0;  /* No HA, no replication */
     }
@@ -1060,7 +1060,7 @@ void ha_metadata_version_changed(uint64_t version) {
     }
 
     /* Log version change */
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Integration: Metadata version changed to %lu", version);
 
     /* If we're the leader, this is normal after applying our own changes */
