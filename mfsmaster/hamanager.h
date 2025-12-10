@@ -78,6 +78,7 @@ typedef enum {
     HA_MSG_SYNC_CHUNK_REQUEST   = 0x0026,   /* Request chunk (offset, size) */
     HA_MSG_SYNC_CHUNK_DATA      = 0x0027,   /* Chunk data (offset, size, CRC, data) */
     HA_MSG_CATCHUP_REQUEST      = 0x0028,   /* Request changelog catchup (follower_version) */
+    HA_MSG_FULL_SYNC_REQUIRED   = 0x0029,   /* Leader tells follower: need full metadata sync */
 
     /* Health and monitoring */
     HA_MSG_PING                 = 0x0030,   /* Simple ping */

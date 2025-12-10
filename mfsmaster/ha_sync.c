@@ -251,10 +251,10 @@ void ha_sync_mark_complete(void) {
     pthread_mutex_lock(&sync_mutex);
     sync_ctx.state = HA_SYNC_STATE_COMPLETE;
     pthread_mutex_unlock(&sync_mutex);
-    
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Sync: Marked as complete");
-    
+
     if (sync_complete_cb != NULL) {
         sync_complete_cb(1);  /* 1 = success */
     }
@@ -809,6 +809,146 @@ void ha_sync_handle_message(uint32_t peer_id, uint8_t msg_type,
                     handle_sync_response(data, len);
                 } else {
                     handle_sync_chunk(data, len);
+                }
+            }
+            break;
+
+        case HA_MSG_SYNC_INFO:
+            /* Sync info from leader: version(8) + filesize(8) */
+            if (len >= 16) {
+                const uint8_t *ptr = data;
+                uint64_t leader_version = get64bit(&ptr);
+                uint64_t file_size = get64bit(&ptr);
+                uint32_t chunk_count;
+                uint8_t chunk_req[12];
+                uint8_t *wptr;
+
+                chunk_count = (file_size + HA_SYNC_CHUNK_SIZE - 1) / HA_SYNC_CHUNK_SIZE;
+                if (chunk_count == 0) chunk_count = 1;
+
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                        "HA Sync: Received sync info: version=%"PRIu64", size=%"PRIu64", chunks=%u",
+                        leader_version, file_size, chunk_count);
+
+                pthread_mutex_lock(&sync_mutex);
+
+                /* Prepare to receive chunks */
+                sync_ctx.target_version = leader_version;
+                sync_ctx.target_checksum = 0;  /* No checksum in this protocol */
+                sync_ctx.file_size = file_size;
+                sync_ctx.total_chunks = chunk_count;
+                sync_ctx.received_chunks = 0;
+                sync_ctx.last_chunk_id = 0;
+                sync_ctx.state = HA_SYNC_STATE_RECEIVING;
+                sync_ctx.last_activity = monotonic_seconds();
+
+                /* Create temp file */
+                get_temp_sync_path(sync_ctx.temp_path, sizeof(sync_ctx.temp_path));
+                sync_ctx.temp_fd = open(sync_ctx.temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+                if (sync_ctx.temp_fd < 0) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                            "HA Sync: Cannot create temp file: %s", strerror(errno));
+                    sync_ctx.state = HA_SYNC_STATE_FAILED;
+                    pthread_mutex_unlock(&sync_mutex);
+                    break;
+                }
+
+                /* Pre-allocate file */
+                if (file_size > 0 && ftruncate(sync_ctx.temp_fd, file_size) < 0) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                            "HA Sync: Cannot pre-allocate file: %s", strerror(errno));
+                }
+
+                pthread_mutex_unlock(&sync_mutex);
+
+                /* Request first chunk: offset(8) + size(4) */
+                wptr = chunk_req;
+                put64bit(&wptr, 0);  /* offset = 0 */
+                put32bit(&wptr, (file_size > HA_SYNC_CHUNK_SIZE) ? HA_SYNC_CHUNK_SIZE : (uint32_t)file_size);
+                ha_send_to_leader(HA_MSG_SYNC_CHUNK_REQUEST, chunk_req, 12);
+            }
+            break;
+
+        case HA_MSG_SYNC_CHUNK_DATA:
+            /* Chunk data from leader: offset(8) + size(4) + crc(4) + data */
+            if (len >= 16) {
+                const uint8_t *ptr = data;
+                uint64_t offset = get64bit(&ptr);
+                uint32_t size = get32bit(&ptr);
+                uint32_t crc = get32bit(&ptr);
+                uint32_t computed_crc;
+                ssize_t written;
+                uint64_t next_offset;
+                uint32_t next_size;
+                uint8_t chunk_req[12];
+                uint8_t *wptr;
+
+                if (len < 16 + size) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                            "HA Sync: Chunk data truncated");
+                    break;
+                }
+
+                /* Verify CRC */
+                computed_crc = mycrc32(0, ptr, size);
+                if (computed_crc != crc) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                            "HA Sync: Chunk CRC mismatch at offset %"PRIu64, offset);
+                    break;
+                }
+
+                pthread_mutex_lock(&sync_mutex);
+
+                if (sync_ctx.state != HA_SYNC_STATE_RECEIVING || sync_ctx.temp_fd < 0) {
+                    pthread_mutex_unlock(&sync_mutex);
+                    break;
+                }
+
+                /* Write chunk to file */
+                if (lseek(sync_ctx.temp_fd, offset, SEEK_SET) < 0) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                            "HA Sync: Seek failed: %s", strerror(errno));
+                    sync_ctx.state = HA_SYNC_STATE_FAILED;
+                    pthread_mutex_unlock(&sync_mutex);
+                    break;
+                }
+
+                written = write(sync_ctx.temp_fd, ptr, size);
+                if (written != (ssize_t)size) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                            "HA Sync: Write failed: %s", strerror(errno));
+                    sync_ctx.state = HA_SYNC_STATE_FAILED;
+                    pthread_mutex_unlock(&sync_mutex);
+                    break;
+                }
+
+                sync_ctx.received_chunks++;
+                sync_ctx.last_activity = monotonic_seconds();
+                next_offset = offset + size;
+
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                        "HA Sync: Received chunk at offset %"PRIu64", size %u (%u/%u)",
+                        offset, size, sync_ctx.received_chunks, sync_ctx.total_chunks);
+
+                /* Check if done */
+                if (next_offset >= sync_ctx.file_size) {
+                    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                            "HA Sync: All chunks received, finalizing");
+                    pthread_mutex_unlock(&sync_mutex);
+                    ha_sync_finalize();
+                } else {
+                    pthread_mutex_unlock(&sync_mutex);
+
+                    /* Request next chunk */
+                    next_size = HA_SYNC_CHUNK_SIZE;
+                    if (sync_ctx.file_size - next_offset < next_size) {
+                        next_size = sync_ctx.file_size - next_offset;
+                    }
+                    wptr = chunk_req;
+                    put64bit(&wptr, next_offset);
+                    put32bit(&wptr, next_size);
+                    ha_send_to_leader(HA_MSG_SYNC_CHUNK_REQUEST, chunk_req, 12);
                 }
             }
             break;

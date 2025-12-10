@@ -991,7 +991,12 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
                             "HA: Peer %u needs full sync (requested %"PRIu64", min available %"PRIu64")",
                             peer->id, follower_version + 1, chlog_minversion);
                     peer->logstate = HA_LOGSTATE_NONE;
-                    /* TODO: trigger full metadata sync to this peer */
+                    /* Send FULL_SYNC_REQUIRED to follower */
+                    uint8_t sync_msg[16];
+                    uint8_t *sync_ptr = sync_msg;
+                    put64bit(&sync_ptr, meta_version());
+                    put64bit(&sync_ptr, chlog_minversion);
+                    ha_send_message(peer, HA_MSG_FULL_SYNC_REQUIRED, sync_msg, 16);
                 } else {
                     /* Catchup possible - switch to DELAYED and send old changelogs */
                     peer->logstate = HA_LOGSTATE_DELAYED;
@@ -1001,6 +1006,20 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
                             peer->id, peer->next_log_version);
                     ha_catchup_peer(peer);
                 }
+            }
+            break;
+        case HA_MSG_FULL_SYNC_REQUIRED:
+            if (cluster->state == HA_STATE_FOLLOWER && payload_len >= 16) {
+                const uint8_t *sync_ptr = payload;
+                uint64_t leader_version = get64bit(&sync_ptr);
+                uint64_t min_available = get64bit(&sync_ptr);
+
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                        "HA: Leader requires full sync (leader_version=%"PRIu64", min_changelog=%"PRIu64")",
+                        leader_version, min_available);
+
+                /* Use existing sync mechanism */
+                ha_sync_request_full();
             }
             break;
         case HA_MSG_SYNC_REQUEST:
@@ -1014,10 +1033,8 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
             break;
         case HA_MSG_SYNC_INFO:
         case HA_MSG_SYNC_CHUNK_DATA:
-            /* These are handled by ha_integration callback */
-            if (sync_info_callback != NULL) {
-                sync_info_callback(header.type, payload, payload_len);
-            }
+            /* Route to ha_sync module for processing */
+            ha_sync_handle_message(peer->id, header.type, payload, payload_len);
             break;
         case HA_MSG_PING:
             ha_send_message(peer, HA_MSG_PONG, NULL, 0);
