@@ -206,6 +206,7 @@ typedef struct ha_request_vote {
     uint32_t    candidate_id;               /* Candidate requesting vote */
     uint64_t    last_log_index;             /* Index of candidate's last log */
     uint64_t    last_log_term;              /* Term of candidate's last log */
+    uint64_t    meta_version;               /* Candidate's metadata version (MooseFS) */
 } __attribute__((packed)) ha_request_vote_t;
 
 /* Vote Response */

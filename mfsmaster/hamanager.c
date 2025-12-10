@@ -163,8 +163,9 @@ static uint32_t ha_catchup_peer(ha_peer_t *peer) {
 /*
  * Initialize peer replication state when they connect/register
  * Determines if peer needs catchup (DELAYED) or is ready (SYNC)
+ * Note: Currently unused but kept for potential future use
  */
-static void ha_init_peer_replication(ha_peer_t *peer, uint64_t peer_version) {
+static void __attribute__((unused)) ha_init_peer_replication(ha_peer_t *peer, uint64_t peer_version) {
     uint64_t current_version;
     uint64_t chlog_minversion;
 
@@ -315,6 +316,59 @@ static void ha_disconnect_peer(ha_peer_t *peer) {
     peer->is_connected = 0;
 }
 
+/*
+ * Ensure we have a connection to the current leader
+ * Called when we receive a heartbeat from a leader
+ * This enables bidirectional communication (follower can send to leader)
+ */
+static void ha_ensure_leader_connection(void) {
+    uint32_t i;
+    ha_peer_t *leader_peer = NULL;
+
+    if (cluster == NULL || cluster->leader_id == 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                "HA: ensure_leader_connection: no cluster or leader_id=0");
+        return;
+    }
+
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+            "HA: ensure_leader_connection: looking for leader %u in %u peers",
+            cluster->leader_id, cluster->peer_count);
+
+    /* Find leader peer */
+    for (i = 0; i < cluster->peer_count; i++) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                "HA: peer[%u] id=%u, connected=%d, sock=%d",
+                i, cluster->peers[i].id, cluster->peers[i].is_connected, cluster->peers[i].sock);
+        if (cluster->peers[i].id == cluster->leader_id) {
+            leader_peer = &cluster->peers[i];
+            break;
+        }
+    }
+
+    if (leader_peer == NULL) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: ensure_leader_connection: leader %u not found in peer list",
+                cluster->leader_id);
+        return;
+    }
+
+    /* Connect if not already connected */
+    if (!leader_peer->is_connected || leader_peer->sock < 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA: Establishing connection to leader %u at %s:%u",
+                cluster->leader_id, leader_peer->hostname, leader_peer->port);
+        if (ha_connect_peer(leader_peer) < 0) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                    "HA: Failed to connect to leader %u", cluster->leader_id);
+        }
+    } else {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
+                "HA: Already connected to leader %u (sock=%d)",
+                cluster->leader_id, leader_peer->sock);
+    }
+}
+
 static int ha_send_message(ha_peer_t *peer, uint16_t type,
                            const uint8_t *payload, uint32_t payload_len) {
     ha_msg_header_t header;
@@ -446,6 +500,10 @@ static void ha_become_follower(uint64_t term, uint32_t leader_id) {
 static void ha_become_candidate(void) {
     uint8_t payload[sizeof(ha_request_vote_t)];
     uint8_t *ptr = payload;
+    uint64_t my_meta_version;
+
+    /* Get meta_version before taking mutex to avoid deadlock */
+    my_meta_version = meta_version();
 
     pthread_mutex_lock(&ha_mutex);
 
@@ -462,11 +520,13 @@ static void ha_become_candidate(void) {
     put32bit(&ptr, cluster->self_id);
     put64bit(&ptr, cluster->last_log_index);
     put64bit(&ptr, cluster->last_log_term);
+    put64bit(&ptr, my_meta_version);  /* Include metadata version */
 
     pthread_mutex_unlock(&ha_mutex);
 
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA: Starting election for term %lu", cluster->current_term);
+            "HA: Starting election for term %lu (meta_version=%"PRIu64")",
+            cluster->current_term, my_meta_version);
 
     /* Request votes from all peers */
     ha_broadcast_message(HA_MSG_REQUEST_VOTE, payload, sizeof(payload));
@@ -547,7 +607,8 @@ static void ha_handle_request_vote(ha_peer_t *peer, const uint8_t *data, uint32_
     uint8_t response[sizeof(ha_vote_response_t)];
     uint8_t *ptr = response;
     const uint8_t *rptr = data;
-    uint64_t term, last_log_index, last_log_term;
+    uint64_t term, last_log_index, last_log_term, candidate_meta_version;
+    uint64_t my_meta_version;
     uint32_t candidate_id;
     uint8_t vote_granted = 0;
 
@@ -561,6 +622,10 @@ static void ha_handle_request_vote(ha_peer_t *peer, const uint8_t *data, uint32_
     candidate_id = get32bit(&rptr);
     last_log_index = get64bit(&rptr);
     last_log_term = get64bit(&rptr);
+    candidate_meta_version = get64bit(&rptr);
+
+    /* Get our metadata version for comparison */
+    my_meta_version = meta_version();
 
     pthread_mutex_lock(&ha_mutex);
 
@@ -585,13 +650,25 @@ static void ha_handle_request_vote(ha_peer_t *peer, const uint8_t *data, uint32_
             (last_log_term == cluster->last_log_term &&
              last_log_index >= cluster->last_log_index)) {
 
-            vote_granted = 1;
-            cluster->voted_for = candidate_id;
-            cluster->last_heartbeat_received = monotonic_seconds();
+            /*
+             * CRITICAL: Check metadata version (MooseFS-specific)
+             * A candidate with older metadata should NOT become leader
+             * as this would cause data loss
+             */
+            if (candidate_meta_version < my_meta_version) {
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                        "HA: Refusing vote to candidate %u - meta_version %"PRIu64" < my %"PRIu64,
+                        candidate_id, candidate_meta_version, my_meta_version);
+                vote_granted = 0;
+            } else {
+                vote_granted = 1;
+                cluster->voted_for = candidate_id;
+                cluster->last_heartbeat_received = monotonic_seconds();
 
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
-                    "HA: Granting vote to candidate %u for term %lu",
-                    candidate_id, term);
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                        "HA: Granting vote to candidate %u for term %lu (meta_version=%"PRIu64")",
+                        candidate_id, term, candidate_meta_version);
+            }
         }
     }
 
@@ -1437,8 +1514,7 @@ static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_
     }
 
     /* Store path for chunk requests */
-    strncpy(peer->sync_path, metadata_path, sizeof(peer->sync_path) - 1);
-    peer->sync_path[sizeof(peer->sync_path) - 1] = '\0';
+    snprintf(peer->sync_path, sizeof(peer->sync_path), "%s", metadata_path);
     peer->sync_filesize = st.st_size;
 
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
@@ -1562,6 +1638,8 @@ static void ha_handle_sync_response(ha_peer_t *peer, const uint8_t *data, uint32
     char temp_path[PATH_MAX];
     int fd;
     ssize_t bytes_written;
+
+    (void)peer;  /* Currently unused, may be used for future enhancements */
 
     if (len < 16) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
@@ -1951,6 +2029,9 @@ int ha_send_to_peer(uint32_t peer_id, uint16_t type, const uint8_t *data, uint32
 int ha_request_catchup(uint64_t my_version) {
     uint8_t payload[8];
     uint8_t *ptr = payload;
+
+    /* Ensure we have a connection to the leader first */
+    ha_ensure_leader_connection();
 
     put64bit(&ptr, my_version);
 
