@@ -497,7 +497,7 @@ static void ha_sync_finalize(void) {
     /* Verify checksum of received file */
     checksum = ha_sync_calculate_checksum(sync_ctx.temp_path);
 
-    if (checksum != sync_ctx.target_checksum) {
+    if (sync_ctx.target_checksum != 0 && checksum != sync_ctx.target_checksum) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
                 "HA Sync: Final checksum mismatch (got %016lx, expected %016lx)",
                 checksum, sync_ctx.target_checksum);
@@ -507,8 +507,14 @@ static void ha_sync_finalize(void) {
         return;
     }
 
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA Sync: Checksum verified, installing new metadata");
+    if (sync_ctx.target_checksum == 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA Sync: Transfer complete (checksum=%016lx), installing metadata",
+                checksum);
+    } else {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA Sync: Checksum verified, installing new metadata");
+    }
 
     /* Backup current metadata */
     get_metadata_path(metadata_path, sizeof(metadata_path));
