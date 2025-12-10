@@ -516,12 +516,12 @@ static void ha_sync_finalize(void) {
                 "HA Sync: Checksum verified, installing new metadata");
     }
 
-    /* Backup current metadata */
-    get_metadata_path(metadata_path, sizeof(metadata_path));
+    /* Backup current metadata.mfs.back (what MooseFS loads at startup) */
+    get_metadata_back_path(metadata_path, sizeof(metadata_path));
     snprintf(backup_path, sizeof(backup_path), "%s.pre_sync", metadata_path);
     rename(metadata_path, backup_path);
 
-    /* Move temp file to metadata.mfs */
+    /* Move temp file to metadata.mfs.back */
     if (rename(sync_ctx.temp_path, metadata_path) < 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
                 "HA Sync: Cannot install metadata: %s", strerror(errno));
