@@ -30,6 +30,7 @@
 #include "metadata.h"
 #include "changelog.h"
 #include "matoclserv.h"
+#include "matocsserv.h"
 #include "clocks.h"
 #include "datapack.h"
 #include "restore.h"
@@ -902,8 +903,13 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
  * Called when full sync with leader is complete
  */
 static void on_sync_complete_cb(void) {
+    char back_path[PATH_MAX];
+    char rollback_path[PATH_MAX];
+    char *dp;
+    int reload_result;
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA Integration: Full synchronization with leader complete");
+            "HA Integration: Full synchronization complete - starting hot reload");
 
     /* Reset sync state */
     pthread_mutex_lock(&ha_int_mutex);
@@ -911,22 +917,82 @@ static void on_sync_complete_cb(void) {
     sync_needed = 0;
     pthread_mutex_unlock(&ha_int_mutex);
 
-    /* Apply any buffered changelogs */
-    apply_buffered_changelogs();
+    /*
+     * Build paths for metadata and rollback.
+     * We work in the DATA_PATH directory, same as the master normally does.
+     */
+    dp = data_path_cache ? data_path_cache : "/var/lib/mfs";
+    snprintf(back_path,     sizeof(back_path),     "%s/metadata.mfs.back",          dp);
+    snprintf(rollback_path, sizeof(rollback_path), "%s/metadata.mfs.back.pre_reload", dp);
 
     /*
-     * NOTE: The metadata file has been updated on disk.
-     * In a production environment, we would need to reload the metadata
-     * into memory. However, MooseFS's meta_restore() may require a restart.
+     * Step 1: Gracefully disconnect all chunkservers and clients.
      *
-     * For now, log a message indicating a restart may be needed.
-     * In a more advanced implementation, we could:
-     * 1. Implement hot reload of metadata
-     * 2. Signal the main process to restart gracefully
-     * 3. Use mmap to share metadata between processes
+     * Since MooseFS runs a single-threaded event loop, we are called
+     * from within a pollit->serve() callback.  No other network callback
+     * can run concurrently.  Disconnecting here is therefore safe and
+     * the connections will be re-established on the next poll iterations
+     * after the reload completes.
+     *
+     * Followers should not have active client write sessions, but we
+     * disconnect them anyway to avoid stale state after the metadata swap.
      */
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-            "HA Integration: Metadata synced. If version mismatch persists, restart may be needed.");
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA Integration: hot reload - disconnecting chunkservers and clients");
+    matocsserv_disconnect_all();
+    matoclserv_disconnect_all();
+
+    /*
+     * Step 2: Keep a rollback copy of the current metadata in case the
+     * reload fails.
+     */
+    rename(back_path, rollback_path);   /* Best-effort — ignore errors */
+
+    /*
+     * Step 3: Hot reload (cleanup → prepare → loadall).
+     * meta_loadall() picks up metadata.mfs.back written by the sync module
+     * and automatically re-applies any on-disk changelogs.
+     */
+    reload_result = meta_hot_reload();
+
+    if (reload_result < 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA Integration: hot reload FAILED - attempting rollback");
+
+        /* Try to restore previous metadata */
+        if (rename(rollback_path, back_path) == 0) {
+            if (meta_hot_reload() == 0) {
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                        "HA Integration: rollback succeeded - running on previous metadata");
+            } else {
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                        "HA Integration: rollback also failed - metadata state unknown");
+            }
+        } else {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                    "HA Integration: rollback file missing - metadata state unknown");
+        }
+        return;
+    }
+
+    /* Step 4: Rollback file no longer needed */
+    unlink(rollback_path);
+
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA Integration: hot reload complete - metadata version=%"PRIu64
+            " - applying buffered changelogs",
+            meta_version());
+
+    /*
+     * Step 5: Apply changelogs that arrived from the leader during the sync.
+     * These were buffered by on_changelog_received_cb() while sync_in_progress
+     * was set.
+     */
+    apply_buffered_changelogs();
+
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA Integration: node fully in sync at version=%"PRIu64,
+            meta_version());
 }
 
 /* ============================================================================

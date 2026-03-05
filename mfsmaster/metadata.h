@@ -1,17 +1,17 @@
 /*
  * Copyright (C) 2025 Jakub Kruszona-Zawadzki, Saglabs SA
- * 
+ *
  * This file is part of MooseFS.
- * 
+ *
  * MooseFS is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, version 2 (only).
- * 
+ *
  * MooseFS is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with MooseFS; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02111-1301, USA
@@ -32,6 +32,7 @@ void meta_allowautorestore(void);
 void meta_emptystart(void);
 void meta_incverboselevel(void);
 void meta_do_store_metadata(void);
+int meta_hot_reload(void);
 
 uint64_t meta_get_id(void);
 void meta_set_id(uint64_t newmetaid);

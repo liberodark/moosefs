@@ -1846,6 +1846,75 @@ int meta_restore(void) {
 	return -1;
 }
 
+/*
+ * Hot reload of metadata for HA follower after a full sync.
+ *
+ * Called from ha_integration.c after the metadata file has been written to
+ * disk by the sync module.  Since this node is a follower (read-only), it is
+ * safe to reload in-place without stopping the process:
+ *
+ *   1. meta_cleanup()               – free all current in-memory structures
+ *   2. meta_prepare_data_structures() – reinitialise empty structures
+ *   3. allowautorestore = 1          – enable .back file discovery
+ *   4. meta_loadall()                – load metadata.mfs.back + apply disk changelogs
+ *
+ * The caller (ha_integration) is responsible for applying any buffered
+ * in-flight changelogs received during the sync via restore_net() after this
+ * function returns.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int meta_hot_reload(void) {
+	mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_NOTICE,
+	        "HA: hot reload of metadata starting");
+
+	/* 1. Free current in-memory state */
+	meta_cleanup();
+
+	/* 2. Reinitialise empty data structures */
+	if (meta_prepare_data_structures() < 0) {
+		mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_ERR,
+		        "HA: hot reload failed - could not prepare data structures");
+		return -1;
+	}
+
+	/* 3. Allow auto-restore so meta_loadall() scans for the best file */
+	allowautorestore = 1;
+
+	/* 4. Load from disk (picks up metadata.mfs.back written by HA sync) */
+	mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_INFO,
+	        "HA: hot reload - loading metadata from disk ...");
+
+	if (meta_loadall() < 0) {
+		mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_ERR,
+		        "HA: hot reload failed - could not load metadata");
+		return -1;
+	}
+
+	/*
+	 * Persist the loaded metadata back to disk as metadata.mfs so that
+	 * a subsequent restart can find it.  meta_loadall() only loads into
+	 * memory — without this step the file is gone from disk.
+	 */
+	uint8_t status = meta_storeall(0, 0);
+	if (status == 1) {
+		if (rename("metadata.mfs.back", "metadata.mfs") < 0) {
+			mfs_log(MFSLOG_ERRNO_SYSLOG_STDERR, MFSLOG_WARNING,
+			        "HA: hot reload - can't rename metadata.mfs.back -> metadata.mfs");
+		}
+	} else if (status != 2) {
+		mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_WARNING,
+		        "HA: hot reload - meta_storeall failed (status=%u), metadata not persisted to disk",
+		        (unsigned)status);
+	}
+
+	mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_NOTICE,
+	        "HA: hot reload complete - metadata version is now %"PRIu64,
+	        meta_version());
+
+	return 0;
+}
+
 const char *meta_store_status_str(void) {
 	switch(laststorestatus) {
 		case LASTSTORE_DOWNLOADED:

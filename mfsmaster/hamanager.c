@@ -1899,6 +1899,15 @@ static void ha_peer_recv_data(ha_peer_t *peer, const uint8_t *data, uint32_t len
         /* We have a complete message: dispatch it */
         ha_handle_message(peer, peer->recvbuf, needed);
 
+        /* ha_handle_message() may have called ha_disconnect_peer(), which
+         * resets recvbuf_len to 0.  If that happened, subtracting 'needed'
+         * from an already-zeroed uint32_t wraps around to ~4G and the
+         * subsequent memmove reads far outside the buffer → SIGSEGV.
+         * Guard against this by bailing out as soon as the peer is gone. */
+        if (!peer->is_connected) {
+            break;
+        }
+
         /* Shift remaining bytes to the front of the buffer */
         peer->recvbuf_len -= needed;
         if (peer->recvbuf_len > 0) {
