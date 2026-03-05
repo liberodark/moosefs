@@ -117,7 +117,9 @@ static void ha_send_old_changelog(void *vpeer, uint64_t version, uint8_t *data, 
  */
 static uint32_t ha_catchup_peer(ha_peer_t *peer) {
     uint32_t n;
-    uint64_t chlog_minversion;
+    uint64_t mem_minversion;
+    uint64_t disk_minversion;
+    uint64_t effective_min;
 
     if (cluster->state != HA_STATE_LEADER) {
         return 0;
@@ -127,20 +129,57 @@ static uint32_t ha_catchup_peer(ha_peer_t *peer) {
         return 0;
     }
 
-    /* Get minimum version available in changelog files */
-    chlog_minversion = changelog_get_minversion();
+    mem_minversion  = changelog_get_minversion();
+    disk_minversion = changelog_get_disk_minversion();
 
-    /* If peer needs versions older than what we have, they need full sync */
-    if (chlog_minversion == 0 || (peer->next_log_version > 0 && chlog_minversion > peer->next_log_version)) {
+    /*
+     * changelog_get_minversion() returns meta_version() when the in-memory
+     * ring-buffer is empty (right after a restart).  Detect that case so we
+     * don't mistake it for "memory has entries starting at meta_version()".
+     */
+    int memory_empty = !changelog_has_memory_entries();
+
+    /*
+     * Determine the effective minimum version we can serve across both memory
+     * and disk.
+     */
+    effective_min = 0;
+    if (!memory_empty && mem_minversion > 0) {
+        effective_min = mem_minversion;
+    }
+    if (disk_minversion > 0 && (effective_min == 0 || disk_minversion < effective_min)) {
+        effective_min = disk_minversion;
+    }
+
+    /* If the peer needs a version older than what we can serve, it needs a
+     * full metadata sync. */
+    if (effective_min == 0 || (peer->next_log_version > 0 && effective_min > peer->next_log_version)) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                "HA: Peer %u needs version %"PRIu64" but min available is %"PRIu64" - needs full sync",
-                peer->id, peer->next_log_version, chlog_minversion);
+                "HA: Peer %u needs version %"PRIu64" but effective min available is %"PRIu64
+                " (mem=%"PRIu64", disk=%"PRIu64") - needs full sync",
+                peer->id, peer->next_log_version,
+                effective_min, mem_minversion, disk_minversion);
         peer->logstate = HA_LOGSTATE_NONE;
         return 0;
     }
 
-    /* Send batch of old changelogs */
-    n = changelog_get_old_changes(peer->next_log_version, ha_send_old_changelog, peer, HA_CHANGELOG_BATCH_SIZE);
+    /* 1. Try in-memory ring-buffer first (fastest) */
+    n = 0;
+    if (!memory_empty) {
+        n = changelog_get_old_changes(peer->next_log_version,
+                                      ha_send_old_changelog, peer,
+                                      HA_CHANGELOG_BATCH_SIZE);
+    }
+
+    /* 2. Fall back to on-disk changelog files */
+    if (n == 0 && disk_minversion > 0 && disk_minversion <= peer->next_log_version) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                "HA: Memory empty for peer %u (needs %"PRIu64"), falling back to disk changelogs",
+                peer->id, peer->next_log_version);
+        n = changelog_get_old_changes_from_disk(peer->next_log_version,
+                                                ha_send_old_changelog, peer,
+                                                HA_CHANGELOG_BATCH_SIZE);
+    }
 
     if (n > 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
@@ -149,7 +188,7 @@ static uint32_t ha_catchup_peer(ha_peer_t *peer) {
         peer->next_log_version += n;
     }
 
-    /* If we sent less than a full batch, peer is now caught up */
+    /* If we sent a full batch, more may follow; otherwise the peer is caught up. */
     if (n < HA_CHANGELOG_BATCH_SIZE) {
         peer->logstate = HA_LOGSTATE_SYNC;
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
@@ -314,6 +353,8 @@ static void ha_disconnect_peer(ha_peer_t *peer) {
         peer->sock = -1;
     }
     peer->is_connected = 0;
+    /* Reset the receive reassembly buffer but keep the allocation */
+    peer->recvbuf_len = 0;
 }
 
 /*
@@ -1233,6 +1274,10 @@ void ha_term(void) {
     /* Disconnect all peers */
     for (i = 0; i < cluster->peer_count; i++) {
         ha_disconnect_peer(&cluster->peers[i]);
+        if (cluster->peers[i].recvbuf != NULL) {
+            free(cluster->peers[i].recvbuf);
+            cluster->peers[i].recvbuf = NULL;
+        }
     }
 
     /* Close listening socket */
@@ -1371,6 +1416,9 @@ int ha_add_peer(const char *host, uint16_t port) {
     peer->logstate = HA_LOGSTATE_NONE;  /* Will be set when peer registers */
     peer->next_log_version = 0;
     peer->acked_version = 0;
+    peer->recvbuf = NULL;
+    peer->recvbuf_len = 0;
+    peer->recvbuf_cap = 0;
     strncpy(peer->hostname, host, sizeof(peer->hostname) - 1);
 
     cluster->peer_count++;
@@ -1755,6 +1803,75 @@ void ha_set_sync_complete_callback(ha_on_sync_complete_fn fn) {
 
 static int ha_lsock_pdescpos = -1;
 
+/*
+ * TCP receive reassembly.
+ *
+ * TCP is a stream protocol: a single read() may return a partial message, or
+ * multiple messages concatenated.  This function appends raw bytes to the
+ * peer's reassembly buffer and dispatches every complete message it finds.
+ *
+ * A message is complete when:
+ *   recvbuf_len >= sizeof(ha_msg_header_t) + header.length
+ *
+ * Safety: if a header carries an absurdly large length we drop the connection
+ * to protect against memory exhaustion.
+ */
+#define HA_MAX_MSG_PAYLOAD (32 * 1024 * 1024)   /* 32 MB hard cap */
+
+static void ha_peer_recv_data(ha_peer_t *peer, const uint8_t *data, uint32_t len) {
+    uint32_t needed;
+    ha_msg_header_t hdr;
+
+    /* Grow reassembly buffer if necessary */
+    if (peer->recvbuf_len + len > peer->recvbuf_cap) {
+        uint32_t new_cap = peer->recvbuf_cap ? peer->recvbuf_cap : 4096;
+        while (new_cap < peer->recvbuf_len + len) {
+            new_cap *= 2;
+        }
+        uint8_t *nb = realloc(peer->recvbuf, new_cap);
+        if (nb == NULL) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                    "HA: OOM growing recvbuf for peer %u – dropping connection", peer->id);
+            ha_disconnect_peer(peer);
+            return;
+        }
+        peer->recvbuf = nb;
+        peer->recvbuf_cap = new_cap;
+    }
+
+    memcpy(peer->recvbuf + peer->recvbuf_len, data, len);
+    peer->recvbuf_len += len;
+
+    /* Dispatch as many complete messages as possible */
+    while (peer->recvbuf_len >= sizeof(ha_msg_header_t)) {
+        memcpy(&hdr, peer->recvbuf, sizeof(ha_msg_header_t));
+
+        /* Sanity-check payload length before allocating */
+        if (hdr.length > HA_MAX_MSG_PAYLOAD) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                    "HA: Peer %u sent oversized payload (%u bytes) – dropping connection",
+                    peer->id, hdr.length);
+            ha_disconnect_peer(peer);
+            return;
+        }
+
+        needed = (uint32_t)sizeof(ha_msg_header_t) + hdr.length;
+
+        if (peer->recvbuf_len < needed) {
+            break;  /* Incomplete message – wait for more data */
+        }
+
+        /* We have a complete message: dispatch it */
+        ha_handle_message(peer, peer->recvbuf, needed);
+
+        /* Shift remaining bytes to the front of the buffer */
+        peer->recvbuf_len -= needed;
+        if (peer->recvbuf_len > 0) {
+            memmove(peer->recvbuf, peer->recvbuf + needed, peer->recvbuf_len);
+        }
+    }
+}
+
 void ha_desc(struct pollfd *pdesc, uint32_t *ndesc) {
     uint32_t pos = *ndesc;
     uint32_t i;
@@ -1823,6 +1940,8 @@ void ha_serve(struct pollfd *pdesc) {
                     }
                     cluster->peers[i].sock = ns;
                     cluster->peers[i].is_connected = 1;
+                    /* Reset receive buffer on new connection */
+                    cluster->peers[i].recvbuf_len = 0;
                     /* Initialize replication state - assume in sync, will catch up if needed */
                     if (cluster->state == HA_STATE_LEADER) {
                         cluster->peers[i].logstate = HA_LOGSTATE_SYNC;
@@ -1856,7 +1975,8 @@ void ha_serve(struct pollfd *pdesc) {
             if (received > 0) {
                 mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
                         "HA: Received %zd bytes from peer %u", received, cluster->peers[i].id);
-                ha_handle_message(&cluster->peers[i], buffer, received);
+                /* Reassemble and dispatch – handles fragmentation and coalescing */
+                ha_peer_recv_data(&cluster->peers[i], buffer, (uint32_t)received);
             } else if (received == 0) {
                 /* Connection closed */
                 mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,

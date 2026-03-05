@@ -116,6 +116,10 @@ typedef struct ha_peer {
     uint8_t     logstate;                   /* NONE=0, DELAYED=1, SYNC=2 */
     uint64_t    next_log_version;           /* Next changelog version to send (for DELAYED) */
     uint64_t    acked_version;              /* Last changelog version ACKed by this peer */
+    /* TCP receive reassembly (handles fragmentation and coalescing) */
+    uint8_t     *recvbuf;                   /* Dynamically allocated receive buffer */
+    uint32_t     recvbuf_len;               /* Valid bytes currently in recvbuf */
+    uint32_t     recvbuf_cap;               /* Allocated capacity of recvbuf */
 } ha_peer_t;
 
 /* Peer log states (metalogger-style) */

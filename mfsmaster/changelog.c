@@ -184,6 +184,138 @@ uint64_t changelog_get_minversion(void) {
 	return old_changes_head->minversion;
 }
 
+int changelog_has_memory_entries(void) {
+	return (old_changes_head != NULL) ? 1 : 0;
+}
+
+/*
+ * Returns the minimum changelog version available on disk (across all
+ * changelog.N.mfs files).  Returns 0 if no on-disk changelogs are found.
+ * Used by the HA module as a fallback when the in-memory ring-buffer is empty
+ * (e.g. right after a master restart).
+ */
+uint64_t changelog_get_disk_minversion(void) {
+	char fname[100];
+	uint64_t fv;
+	uint32_t i;
+
+	/* Scan from the oldest possible file (highest rotation number) downward.
+	 * The first file that exists and has a valid first version is the oldest. */
+	for (i = BackLogsNumber; i > 0; i--) {
+		snprintf(fname, 100, "changelog.%"PRIu32".mfs", i);
+		fv = changelog_findfirstversion(fname);
+		if (fv > 0) {
+			return fv;
+		}
+	}
+
+	/* Fall back to the current (live) log file */
+	fv = changelog_findfirstversion("changelog.0.mfs");
+	return fv;  /* 0 if not found */
+}
+
+/*
+ * Stream changelog entries >= version from on-disk files, calling sendfn for
+ * each.  Files are scanned in chronological order (highest rotation number
+ * first, then 0).  Returns the number of entries sent.
+ *
+ * This is identical in signature to changelog_get_old_changes() so that
+ * ha_catchup_peer() can use it transparently as a fallback.
+ */
+uint32_t changelog_get_old_changes_from_disk(uint64_t version,
+		void (*sendfn)(void *,uint64_t,uint8_t *,uint32_t),
+		void *userdata, uint32_t limit) {
+	char fname[100];
+	FILE *f;
+	char *line;
+	uint32_t count = 0;
+	uint64_t lv;
+	uint32_t i;
+	int32_t start_file;
+	char *p;
+	uint32_t dlen;
+
+	if (limit == 0) {
+		return 0;
+	}
+
+	line = malloc(MAXLOGLINESIZE);
+	if (line == NULL) {
+		return 0;
+	}
+
+	/*
+	 * Determine start_file: the oldest file (highest rotation number) whose
+	 * first version is <= version.  Scanning backward (from BackLogsNumber to
+	 * 0) we stop at the first hit so that we don't overshoot.
+	 */
+	start_file = 0;  /* default: start from changelog.0.mfs */
+	for (i = BackLogsNumber; i > 0; i--) {
+		snprintf(fname, 100, "changelog.%"PRIu32".mfs", i);
+		lv = changelog_findfirstversion(fname);
+		if (lv > 0 && lv <= version) {
+			start_file = (int32_t)i;
+			break;
+		}
+	}
+
+	/* Stream entries from start_file down to 0 (0 = current live file) */
+	for (i = (uint32_t)start_file; ; i--) {
+		if (i > 0) {
+			snprintf(fname, 100, "changelog.%"PRIu32".mfs", i);
+		} else {
+			snprintf(fname, 100, "changelog.0.mfs");
+		}
+
+		f = fopen(fname, "r");
+		if (f != NULL) {
+			while (fgets(line, MAXLOGLINESIZE, f) != NULL) {
+				/* Parse: "VERSION: OPERATION\n" */
+				lv = 0;
+				p = line;
+				while (*p >= '0' && *p <= '9') {
+					lv = lv * 10 + (uint64_t)(*p - '0');
+					p++;
+				}
+				if (*p != ':') {
+					continue;  /* Malformed line */
+				}
+				p++;  /* skip ':' */
+				if (*p == ' ') {
+					p++;  /* skip optional space */
+				}
+
+				if (lv < version) {
+					continue;  /* Entry predates what the peer needs */
+				}
+
+				/* Trim trailing CR/LF */
+				dlen = strlen(p);
+				while (dlen > 0 && (p[dlen-1] == '\n' || p[dlen-1] == '\r')) {
+					dlen--;
+				}
+
+				sendfn(userdata, lv, (uint8_t *)p, dlen);
+				count++;
+
+				if (count >= limit) {
+					fclose(f);
+					free(line);
+					return count;
+				}
+			}
+			fclose(f);
+		}
+
+		if (i == 0) {
+			break;
+		}
+	}
+
+	free(line);
+	return count;
+}
+
 void changelog_rotate(uint8_t rotate_flags) {
 	if (ChangelogSaveMode!=SAVEMODE_BACKGROUND) {
 		rotate_flags |= ROTATE_FLAG_FOREGROUND;

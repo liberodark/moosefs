@@ -26,6 +26,12 @@
 uint32_t changelog_get_old_changes(uint64_t version,void (*sendfn)(void *,uint64_t,uint8_t *,uint32_t),void *userdata,uint32_t limit);
 uint64_t changelog_get_minversion(void);
 
+/* HA: disk-based changelog access (fallback when memory ring-buffer is empty) */
+uint64_t changelog_get_disk_minversion(void);
+uint32_t changelog_get_old_changes_from_disk(uint64_t version,void (*sendfn)(void *,uint64_t,uint8_t *,uint32_t),void *userdata,uint32_t limit);
+/* Returns 1 if the in-memory ring-buffer has at least one entry, 0 otherwise */
+int changelog_has_memory_entries(void);
+
 #define ROTATE_FLAG_BROADCAST 1
 #define ROTATE_FLAG_FOREGROUND 2
 
