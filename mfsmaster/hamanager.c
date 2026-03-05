@@ -552,6 +552,7 @@ static void ha_become_candidate(void) {
     cluster->current_term++;
     cluster->voted_for = cluster->self_id;
     cluster->votes_received = 1;  /* Vote for self */
+    cluster->votes_refused_version = 0;  /* Reset refusal tracking */
     cluster->election_timeout = ha_random_timeout();
     cluster->election_start = monotonic_seconds();
     cluster->elections_started++;
@@ -646,8 +647,7 @@ static void ha_send_heartbeats(void) {
 
 static void ha_handle_request_vote(ha_peer_t *peer, const uint8_t *data, uint32_t len) {
     uint8_t response[sizeof(ha_vote_response_t)];
-    uint8_t *ptr = response;
-    const uint8_t *rptr = data;
+    uint8_t *ptr = response;    const uint8_t *rptr = data;
     uint64_t term, last_log_index, last_log_term, candidate_meta_version;
     uint64_t my_meta_version;
     uint32_t candidate_id;
@@ -717,6 +717,7 @@ static void ha_handle_request_vote(ha_peer_t *peer, const uint8_t *data, uint32_
     put64bit(&ptr, cluster->current_term);
     put8bit(&ptr, vote_granted);
     put32bit(&ptr, cluster->self_id);
+    put64bit(&ptr, vote_granted ? 0ULL : my_meta_version);  /* Include our version on refusal */
 
     pthread_mutex_unlock(&ha_mutex);
 
@@ -728,16 +729,23 @@ static void ha_handle_vote_response(ha_peer_t *peer, const uint8_t *data, uint32
     uint64_t term;
     uint8_t vote_granted;
     uint32_t voter_id;
+    uint64_t voter_meta_version = 0;
 
     (void)peer;  /* Used for future extensions */
 
-    if (len < sizeof(ha_vote_response_t)) {
+    if (len < sizeof(ha_vote_response_t) - sizeof(uint64_t)) {
+        /* Minimum: term(8) + vote_granted(1) + voter_id(4) */
         return;
     }
 
     term = get64bit(&rptr);
     vote_granted = get8bit(&rptr);
     voter_id = get32bit(&rptr);
+
+    /* voter_meta_version is optional for backward compatibility */
+    if (len >= sizeof(ha_vote_response_t)) {
+        voter_meta_version = get64bit(&rptr);
+    }
 
     pthread_mutex_lock(&ha_mutex);
 
@@ -766,6 +774,33 @@ static void ha_handle_vote_response(ha_peer_t *peer, const uint8_t *data, uint32
         if (cluster->votes_received >= cluster->quorum_size) {
             pthread_mutex_unlock(&ha_mutex);
             ha_become_leader();
+            return;
+        }
+
+        pthread_mutex_unlock(&ha_mutex);
+        return;
+    }
+
+    /* Vote refused — check if it's a meta_version issue */
+    if (!vote_granted && voter_meta_version > 0) {
+        uint64_t my_version = meta_version();
+
+        if (voter_meta_version > my_version) {
+            /* Track the highest version seen so far in this election */
+            if (voter_meta_version > cluster->votes_refused_version) {
+                cluster->votes_refused_version = voter_meta_version;
+            }
+
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                    "HA: Vote refused by %u - their meta_version %"PRIu64" > my %"PRIu64
+                    " - stepping down and requesting catchup",
+                    voter_id, voter_meta_version, my_version);
+
+            pthread_mutex_unlock(&ha_mutex);
+
+            /* Become follower (stops election loop) then request catchup */
+            ha_become_follower(term, 0);
+            ha_request_catchup(my_version);
             return;
         }
     }

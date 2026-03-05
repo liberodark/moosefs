@@ -175,6 +175,7 @@ typedef struct ha_cluster {
     /* Synchronization */
     uint64_t    sync_target_version;        /* Target metadata version */
     uint8_t     sync_in_progress;           /* Sync operation in progress */
+    uint64_t    votes_refused_version;      /* Highest meta_version seen in vote refusals this election */
 
     /* Statistics */
     uint64_t    elections_started;          /* Number of elections started */
@@ -219,6 +220,7 @@ typedef struct ha_vote_response {
     uint64_t    term;                       /* Current term for candidate */
     uint8_t     vote_granted;               /* True if vote granted */
     uint32_t    voter_id;                   /* Voter's ID */
+    uint64_t    voter_meta_version;         /* Voter's metadata version (0 if vote granted) */
 } __attribute__((packed)) ha_vote_response_t;
 
 /* AppendEntries RPC */
