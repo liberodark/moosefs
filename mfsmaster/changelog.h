@@ -32,6 +32,10 @@ uint32_t changelog_get_old_changes_from_disk(uint64_t version,void (*sendfn)(voi
 /* Returns 1 if the in-memory ring-buffer has at least one entry, 0 otherwise */
 int changelog_has_memory_entries(void);
 
+/* HA: store a changelog entry in the ring buffer without broadcasting to metaloggers.
+ * Used by followers so they can serve catchup if they become leader. */
+void changelog_store_entry(uint64_t version, const uint8_t *logstr, uint32_t logstrsize);
+
 #define ROTATE_FLAG_BROADCAST 1
 #define ROTATE_FLAG_FOREGROUND 2
 

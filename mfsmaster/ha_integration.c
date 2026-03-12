@@ -60,9 +60,6 @@ static uint64_t last_sync_request_time = 0;
 static uint64_t changelog_buffer_count = 0;
 static char *data_path_cache = NULL;
 
-/* Changelog file for persistence (like metalogger) */
-static FILE *changelog_fd = NULL;
-
 /* Changelog buffer for when sync is in progress */
 #define CHANGELOG_BUFFER_SIZE 1000
 typedef struct {
@@ -766,15 +763,12 @@ static void apply_buffered_changelogs(void) {
 
                 pthread_mutex_unlock(&ha_int_mutex);
 
-                /* Write to disk */
-                if (changelog_fd != NULL) {
-                    fprintf(changelog_fd, "%"PRIu64": %s\n", entry->version, changelog_line);
-                    fflush(changelog_fd);
-                }
-
                 /* Apply to memory - restore_net expects current_version (before applying) */
                 result = restore_net(current_version, changelog_line, &ts);
                 if (result == 0) {
+                    /* Store in ring buffer + disk (same as on_changelog_received_cb) */
+                    changelog_store_entry(entry->version, (const uint8_t *)changelog_line, entry->len);
+                    changelog_mr(entry->version, changelog_line);
                     current_version = entry->version;
                     applied++;
                 } else {
@@ -861,29 +855,8 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
     changelog_line[len] = '\0';
 
     /*
-     * STEP 1: Write to disk for persistence (like metalogger)
-     */
-    if (changelog_fd == NULL) {
-        char path[256];
-        snprintf(path, sizeof(path), "%s/changelog_ha.0.mfs",
-                 data_path_cache ? data_path_cache : "/var/lib/mfs");
-        changelog_fd = fopen(path, "a");
-        if (changelog_fd == NULL) {
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                    "HA Integration: Cannot open changelog file for writing");
-        }
-    }
-
-    if (changelog_fd != NULL) {
-        fprintf(changelog_fd, "%"PRIu64": %s\n", version, changelog_line);
-        fflush(changelog_fd);
-    }
-
-    /*
-     * STEP 2: Apply to memory using restore_net()
-     * This is the key difference from metalogger - we apply LIVE
-     * NOTE: restore_net() expects the version BEFORE applying (current_version),
-     * not the version of the changelog being applied (version).
+     * Apply to memory using restore_net()
+     * restore_net() expects the version BEFORE applying (current_version).
      * It will verify: lv == meta_version() before, and lv+1 == meta_version() after.
      */
     result = restore_net(current_version, changelog_line, &ts);
@@ -891,6 +864,19 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
     if (result == 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA Integration: Applied changelog %lu to memory (ts=%u)", version, ts);
+
+        /*
+         * STEP 3: Store in the in-memory ring buffer so that if this node
+         * becomes leader, it can serve catchup to peers that are behind.
+         * Without this, a newly elected leader has no changelogs to send.
+         */
+        changelog_store_entry(version, (const uint8_t *)changelog_line, len);
+
+        /*
+         * STEP 4: Write to the standard changelog files (changelog.0.mfs)
+         * so they survive restarts and can be used for disk-based catchup.
+         */
+        changelog_mr(version, changelog_line);
 
         /* Check if we can apply buffered changelogs (after catchup) */
         if (changelog_buffer_count > 0) {
@@ -1066,12 +1052,6 @@ int ha_integration_init(void) {
 }
 
 void ha_integration_term(void) {
-    /* Close changelog file if open */
-    if (changelog_fd != NULL) {
-        fclose(changelog_fd);
-        changelog_fd = NULL;
-    }
-
     /* Free data path cache */
     if (data_path_cache != NULL) {
         free(data_path_cache);

@@ -184,6 +184,48 @@ uint64_t changelog_get_minversion(void) {
 	return old_changes_head->minversion;
 }
 
+/*
+ * Store a changelog entry in the in-memory ring buffer WITHOUT broadcasting
+ * to metaloggers. Used by HA followers to keep changelogs available for
+ * catchup if this node later becomes leader.
+ */
+void changelog_store_entry(uint64_t version, const uint8_t *logstr, uint32_t logstrsize) {
+	old_changes_block *oc;
+	old_changes_entry *oce;
+	uint32_t ts;
+
+	if (ChangelogSecondsToRemember==0) {
+		return;
+	}
+	if (old_changes_current==NULL || old_changes_head==NULL || old_changes_current->entries>=OLD_CHANGES_BLOCK_SIZE) {
+		oc = malloc(sizeof(old_changes_block));
+		passert(oc);
+		ts = main_time();
+		oc->entries = 0;
+		oc->size = 0;
+		oc->minversion = version;
+		oc->mintimestamp = ts;
+		oc->next = NULL;
+		if (old_changes_current==NULL || old_changes_head==NULL) {
+			old_changes_head = old_changes_current = oc;
+		} else {
+			old_changes_current->next = oc;
+			old_changes_current = oc;
+		}
+		changelog_old_changes_free(ts);
+	}
+	oc = old_changes_current;
+	oce = oc->old_changes_block + oc->entries;
+	oce->version = version;
+	oce->length = logstrsize;
+	oce->data = malloc(logstrsize);
+	passert(oce->data);
+	memcpy(oce->data,logstr,logstrsize);
+	oc->entries++;
+	oc->size += logstrsize+sizeof(old_changes_entry);
+	old_changes_total_size += logstrsize+sizeof(old_changes_entry);
+}
+
 int changelog_has_memory_entries(void) {
 	return (old_changes_head != NULL) ? 1 : 0;
 }
