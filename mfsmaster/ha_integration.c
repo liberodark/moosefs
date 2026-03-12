@@ -580,8 +580,24 @@ int ha_pre_metadata_sync(void) {
 
     /* Check if metadata already exists */
     if (metadata_file_exists(data_path)) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
-                "HA Pre-sync: Metadata file exists, skipping sync");
+        /*
+         * Delete local changelogs — they may be out of sync with metadata.mfs.back.
+         * This happens when a follower restarts: the bgsaver saved metadata at
+         * version X, but changelogs from the leader's replication may start at
+         * a different version, causing "version mismatch" at meta_loadall().
+         * It's safe to delete them because this node will sync from the leader
+         * after joining the cluster.
+         */
+        {
+            char rmpath[PATH_MAX];
+            uint32_t n;
+            for (n = 0; n <= 50; n++) {
+                snprintf(rmpath, sizeof(rmpath), "%s/changelog.%"PRIu32".mfs", data_path, n);
+                unlink(rmpath);
+            }
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                    "HA Pre-sync: Metadata exists, cleaned changelogs to avoid version mismatch");
+        }
         free(data_path);
         return 0;
     }
