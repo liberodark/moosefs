@@ -40,18 +40,18 @@
 # Heartbeat interval in milliseconds
 # The leader sends heartbeats to followers at this interval
 # Should be much smaller than election timeout
-# Default: 150
-# HA_HEARTBEAT_MS = 150
+# Default: 1000
+# HA_HEARTBEAT_MS = 1000
 
 # Minimum election timeout in milliseconds
 # If a follower doesn't receive a heartbeat within this time, it starts an election
-# Default: 300
-# HA_ELECTION_TIMEOUT_MIN_MS = 300
+# Default: 5000
+# HA_ELECTION_TIMEOUT_MIN_MS = 5000
 
 # Maximum election timeout in milliseconds
 # Actual timeout is randomly chosen between min and max to avoid split votes
-# Default: 500
-# HA_ELECTION_TIMEOUT_MAX_MS = 500
+# Default: 10000
+# HA_ELECTION_TIMEOUT_MAX_MS = 10000
 
 ###############################################################################
 # FAILOVER CONFIGURATION

@@ -32,9 +32,9 @@
 
 #define HA_MAX_PEERS            16          /* Maximum number of masters in cluster */
 #define HA_DEFAULT_PORT         9418        /* Default HA communication port */
-#define HA_HEARTBEAT_MS         150         /* Heartbeat interval in milliseconds */
-#define HA_ELECTION_TIMEOUT_MIN 1500        /* Minimum election timeout (ms) */
-#define HA_ELECTION_TIMEOUT_MAX 3000        /* Maximum election timeout (ms) */
+#define HA_HEARTBEAT_MS         1000        /* Heartbeat interval in milliseconds (must be >= poll tick of 1s) */
+#define HA_ELECTION_TIMEOUT_MIN 5000        /* Minimum election timeout (ms) */
+#define HA_ELECTION_TIMEOUT_MAX 10000       /* Maximum election timeout (ms) */
 #define HA_SYNC_TIMEOUT_MS      5000        /* Sync timeout in milliseconds */
 #define HA_META_DL_BLOCK        1000000     /* Metadata download block size (1MB, like metalogger) */
 
@@ -91,6 +91,14 @@ typedef enum {
  * Data Structures
  * ============================================================================ */
 
+/* Output packet queue (non-blocking writes, like matomlserv.c) */
+typedef struct ha_out_packet {
+    struct ha_out_packet *next;
+    uint8_t *startptr;              /* Current position in data */
+    uint32_t bytesleft;             /* Bytes remaining to send */
+    uint8_t data[1];                /* Flexible array: header + payload */
+} ha_out_packet_t;
+
 /* Peer information */
 typedef struct ha_peer {
     uint32_t    id;                         /* Unique peer ID */
@@ -123,6 +131,9 @@ typedef struct ha_peer {
     uint8_t     *recvbuf;                   /* Dynamically allocated receive buffer */
     uint32_t     recvbuf_len;               /* Valid bytes currently in recvbuf */
     uint32_t     recvbuf_cap;               /* Allocated capacity of recvbuf */
+    /* Non-blocking output queue (like matomlserv.c out_packetstruct) */
+    ha_out_packet_t *outputhead;            /* First queued packet */
+    ha_out_packet_t **outputtail;           /* Pointer to last ->next pointer */
 } ha_peer_t;
 
 /* Peer log states (metalogger-style) */

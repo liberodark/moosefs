@@ -29,6 +29,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <limits.h>
+#include <stddef.h>
 #include <sys/stat.h>
 #include <pthread.h>
 
@@ -306,7 +307,6 @@ const char* ha_state_str(ha_state_t state) {
 
 static int ha_connect_peer(ha_peer_t *peer) {
     int sock;
-    int flags;
 
     if (peer->is_connected && peer->sock >= 0) {
         return 0;
@@ -317,24 +317,15 @@ static int ha_connect_peer(ha_peer_t *peer) {
         return -1;
     }
 
+    tcpnonblock(sock);
     tcpnodelay(sock);
 
-    /* Set a connection timeout using setsockopt */
-    struct timeval tv;
-    tv.tv_sec = 2;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     if (tcpnumconnect(sock, peer->ip, peer->port) < 0) {
+        /* tcpnumconnect returns <0 on immediate failure.
+         * For non-blocking, EINPROGRESS is normal - but tcpnumconnect
+         * handles that internally, so a failure here is real. */
         tcpclose(sock);
         return -1;
-    }
-
-    /* Ensure socket is in blocking mode */
-    flags = fcntl(sock, F_GETFL, 0);
-    if (flags != -1) {
-        fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
     }
 
     peer->sock = sock;
@@ -347,6 +338,7 @@ static int ha_connect_peer(ha_peer_t *peer) {
 }
 
 static void ha_disconnect_peer(ha_peer_t *peer) {
+    ha_out_packet_t *opack, *next;
     if (peer->sock >= 0) {
         tcpclose(peer->sock);
         peer->sock = -1;
@@ -358,6 +350,15 @@ static void ha_disconnect_peer(ha_peer_t *peer) {
     peer->is_connected = 0;
     /* Reset the receive reassembly buffer but keep the allocation */
     peer->recvbuf_len = 0;
+    /* Free all queued output packets */
+    opack = peer->outputhead;
+    while (opack != NULL) {
+        next = opack->next;
+        free(opack);
+        opack = next;
+    }
+    peer->outputhead = NULL;
+    peer->outputtail = &(peer->outputhead);
 }
 
 /*
@@ -416,21 +417,14 @@ static void ha_ensure_leader_connection(void) {
 static int ha_send_message(ha_peer_t *peer, uint16_t type,
                            const uint8_t *payload, uint32_t payload_len) {
     ha_msg_header_t header;
-    uint8_t *buffer;
+    ha_out_packet_t *opack;
     uint32_t total_len;
-    ssize_t sent;
-    int flags;
+    uint8_t *ptr;
 
     if (!peer->is_connected || peer->sock < 0) {
         if (ha_connect_peer(peer) < 0) {
             return -1;
         }
-    }
-
-    /* Ensure socket is blocking before send */
-    flags = fcntl(peer->sock, F_GETFL, 0);
-    if (flags != -1 && (flags & O_NONBLOCK)) {
-        fcntl(peer->sock, F_SETFL, flags & ~O_NONBLOCK);
     }
 
     /* Build header */
@@ -443,36 +437,68 @@ static int ha_send_message(ha_peer_t *peer, uint16_t type,
     header.crc32 = payload_len > 0 ? ha_crc32(payload, payload_len) : 0;
 
     total_len = sizeof(header) + payload_len;
-    buffer = malloc(total_len);
-    if (buffer == NULL) {
+
+    /* Allocate output packet with flexible array (same pattern as matomlserv.c) */
+    opack = malloc(offsetof(ha_out_packet_t, data) + total_len);
+    if (opack == NULL) {
         return -1;
     }
 
-    memcpy(buffer, &header, sizeof(header));
+    opack->next = NULL;
+    opack->bytesleft = total_len;
+    opack->startptr = opack->data;
+
+    /* Copy header + payload into packet */
+    ptr = opack->data;
+    memcpy(ptr, &header, sizeof(header));
     if (payload_len > 0 && payload != NULL) {
-        memcpy(buffer + sizeof(header), payload, payload_len);
+        memcpy(ptr + sizeof(header), payload, payload_len);
     }
 
-    sent = write(peer->sock, buffer, total_len);
-    free(buffer);
-
-    if (sent < 0) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                "HA: Failed to send message to peer %u: %s (errno=%d, sock=%d)",
-                peer->id, strerror(errno), errno, peer->sock);
-        ha_disconnect_peer(peer);
-        return -1;
-    }
-
-    if (sent != (ssize_t)total_len) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                "HA: Partial send to peer %u: sent %zd of %u bytes",
-                peer->id, sent, total_len);
-        ha_disconnect_peer(peer);
-        return -1;
-    }
+    /* Enqueue — will be sent from ha_serve() when socket is writable */
+    *(peer->outputtail) = opack;
+    peer->outputtail = &(opack->next);
 
     return 0;
+}
+
+/*
+ * Flush output queue for a peer (called from ha_serve on POLLOUT).
+ * Uses non-blocking write, handles partial sends.
+ * Returns: 0 = more data to send, 1 = queue empty, -1 = error (peer disconnected)
+ */
+static int ha_peer_flush_output(ha_peer_t *peer) {
+    ha_out_packet_t *opack;
+    ssize_t i;
+
+    while (peer->outputhead != NULL) {
+        opack = peer->outputhead;
+        i = write(peer->sock, opack->startptr, opack->bytesleft);
+        if (i < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;  /* Would block — try again next poll cycle */
+            }
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                    "HA: Write error to peer %u: %s", peer->id, strerror(errno));
+            ha_disconnect_peer(peer);
+            return -1;
+        }
+        if (i == 0) {
+            return 0;
+        }
+        opack->startptr += i;
+        opack->bytesleft -= i;
+        if (opack->bytesleft > 0) {
+            return 0;  /* Partial send — continue next poll cycle */
+        }
+        /* Packet fully sent — remove from queue */
+        peer->outputhead = opack->next;
+        if (peer->outputhead == NULL) {
+            peer->outputtail = &(peer->outputhead);
+        }
+        free(opack);
+    }
+    return 1;  /* Queue empty */
 }
 
 static int ha_broadcast_message(uint16_t type, const uint8_t *payload, uint32_t payload_len) {
@@ -1458,6 +1484,8 @@ int ha_add_peer(const char *host, uint16_t port) {
     peer->recvbuf = NULL;
     peer->recvbuf_len = 0;
     peer->recvbuf_cap = 0;
+    peer->outputhead = NULL;
+    peer->outputtail = &(peer->outputhead);
     strncpy(peer->hostname, host, sizeof(peer->hostname) - 1);
 
     cluster->peer_count++;
@@ -1984,6 +2012,9 @@ void ha_desc(struct pollfd *pdesc, uint32_t *ndesc) {
         if (cluster->peers[i].sock >= 0 && cluster->peers[i].is_connected) {
             pdesc[pos].fd = cluster->peers[i].sock;
             pdesc[pos].events = POLLIN;
+            if (cluster->peers[i].outputhead != NULL) {
+                pdesc[pos].events |= POLLOUT;
+            }
             cluster->peers[i].pdescpos = pos;
             pos++;
         } else {
@@ -2055,10 +2086,27 @@ void ha_serve(struct pollfd *pdesc) {
 
     /* Process peer sockets */
     for (i = 0; i < cluster->peer_count; i++) {
-        if (cluster->peers[i].pdescpos >= 0 &&
-            cluster->peers[i].sock >= 0 &&
-            (pdesc[cluster->peers[i].pdescpos].revents & POLLIN)) {
+        if (cluster->peers[i].pdescpos < 0 || cluster->peers[i].sock < 0) {
+            continue;
+        }
 
+        /* Handle errors */
+        if (pdesc[cluster->peers[i].pdescpos].revents & (POLLERR | POLLHUP)) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                    "HA: Peer %u connection error/hangup", cluster->peers[i].id);
+            ha_disconnect_peer(&cluster->peers[i]);
+            continue;
+        }
+
+        /* Handle writable — flush output queue */
+        if (pdesc[cluster->peers[i].pdescpos].revents & POLLOUT) {
+            if (ha_peer_flush_output(&cluster->peers[i]) < 0) {
+                continue;  /* Peer was disconnected */
+            }
+        }
+
+        /* Handle readable — receive data */
+        if (pdesc[cluster->peers[i].pdescpos].revents & POLLIN) {
             received = read(cluster->peers[i].sock, buffer, sizeof(buffer));
             if (received > 0) {
                 mfs_log(MFSLOG_SYSLOG, MFSLOG_DEBUG,
