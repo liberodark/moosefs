@@ -290,14 +290,6 @@ static inline int matoclserv_fuse_write_chunk_common(matoclserventry *eptr,uint3
 		return 0;
 	}
 
-	/* Check if we're the HA leader and can accept writes */
-	if (!ha_can_accept_write()) {
-		ptr = matoclserv_create_packet(eptr, MATOCL_FUSE_WRITE_CHUNK, 5);
-		put32bit(&ptr, msgid);
-		put8bit(&ptr, MFS_ERROR_NOTLEADER);
-		return 0;
-	}
-
 	if (sessions_get_disables(eptr->sesdata)&DISABLE_WRITE) {
 		status = MFS_ERROR_EPERM;
 	} else if (sessions_get_sesflags(eptr->sesdata)&SESFLAG_READONLY) {

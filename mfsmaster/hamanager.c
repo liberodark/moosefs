@@ -723,15 +723,31 @@ static void ha_handle_pre_vote(ha_peer_t *peer, const uint8_t *data, uint32_t le
      * 1. Candidate's term >= our term
      * 2. Candidate's log is up-to-date
      * 3. Candidate's meta_version >= ours
-     * 4. We haven't heard from a leader recently (our own election timeout expired) */
+     * 4. No active leader — either no leader is known, or the known leader
+     *    is no longer connected.  We do NOT use elapsed time here because
+     *    ha_start_pre_vote() resets last_heartbeat_received, which would
+     *    cause peers that are both pre-voting to reject each other. */
 
-    elapsed = monotonic_seconds() - cluster->last_heartbeat_received;
+    int leader_alive = 0;
+    if (cluster->leader_id != 0 && cluster->leader_id != cluster->self_id) {
+        uint32_t j;
+        for (j = 0; j < cluster->peer_count; j++) {
+            if (cluster->peers[j].id == cluster->leader_id && cluster->peers[j].is_connected) {
+                /* Leader is still connected — check if we've heard from it recently */
+                elapsed = monotonic_seconds() - cluster->last_heartbeat_received;
+                if (elapsed < cluster->election_timeout) {
+                    leader_alive = 1;
+                }
+                break;
+            }
+        }
+    }
 
-    if (term >= cluster->current_term &&
+    if (!leader_alive &&
+        term >= cluster->current_term &&
         candidate_meta_version >= my_meta_version &&
         (last_log_term > cluster->last_log_term ||
-         (last_log_term == cluster->last_log_term && last_log_index >= cluster->last_log_index)) &&
-        elapsed >= cluster->election_timeout) {
+         (last_log_term == cluster->last_log_term && last_log_index >= cluster->last_log_index))) {
         vote_granted = 1;
     }
 
