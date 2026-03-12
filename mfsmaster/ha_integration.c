@@ -633,12 +633,18 @@ int ha_pre_metadata_sync(void) {
         mfd = open(metapath, O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (mfd >= 0) {
             /* Write "MFSM NEW" header — same as metadata.mfs.empty */
-            write(mfd, "MFSM NEW", 8);
-            close(mfd);
-            /* Enable auto-restore so meta_init() accepts the empty file */
-            meta_allowautorestore();
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                    "HA Pre-sync: Created empty metadata.mfs - will sync from leader after election");
+            if (write(mfd, "MFSM NEW", 8) != 8) {
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                        "HA Pre-sync: Failed to write empty metadata header");
+                close(mfd);
+                unlink(metapath);
+            } else {
+                close(mfd);
+                /* Enable auto-restore so meta_init() accepts the empty file */
+                meta_allowautorestore();
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                        "HA Pre-sync: Created empty metadata.mfs - will sync from leader after election");
+            }
         } else {
             mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
                     "HA Pre-sync: Could not create empty metadata.mfs: %s", strerror(errno));
@@ -681,20 +687,24 @@ static void on_become_leader_cb(void) {
  * Called when this node becomes a follower
  */
 static void on_become_follower_cb(uint32_t leader_id) {
+    uint32_t leader_ip;
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Integration: This node is now a FOLLOWER, leader=%u", leader_id);
 
+    /* Resolve actual IP from peer list */
+    leader_ip = ha_get_leader_peer_ip();
+
     pthread_mutex_lock(&ha_int_mutex);
-    /* Would need to resolve leader_id to IP - simplified for now */
-    cached_leader_ip = leader_id;  /* In real impl, resolve from peer list */
+    cached_leader_ip = leader_ip;
     pthread_mutex_unlock(&ha_int_mutex);
 
-    /*
-     * When becoming follower:
-     * 1. Stop accepting write operations
-     * 2. Redirect writes to leader
-     * 3. Continue serving read operations if configured
-     */
+    if (leader_ip != 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA Integration: Leader IP resolved to %u.%u.%u.%u",
+                (leader_ip >> 24) & 0xFF, (leader_ip >> 16) & 0xFF,
+                (leader_ip >> 8) & 0xFF, leader_ip & 0xFF);
+    }
 }
 
 /*
@@ -785,9 +795,8 @@ static void apply_buffered_changelogs(void) {
                 /* Apply to memory - restore_net expects current_version (before applying) */
                 result = restore_net(current_version, changelog_line, &ts);
                 if (result == 0) {
-                    /* Store in ring buffer + disk (same as on_changelog_received_cb) */
+                    /* Ring buffer only — no disk (see on_changelog_received_cb comment) */
                     changelog_store_entry(entry->version, (const uint8_t *)changelog_line, entry->len);
-                    changelog_mr(entry->version, changelog_line);
                     current_version = entry->version;
                     applied++;
                 } else {
@@ -885,17 +894,16 @@ static void on_changelog_received_cb(uint64_t version, const uint8_t *data, uint
                 "HA Integration: Applied changelog %lu to memory (ts=%u)", version, ts);
 
         /*
-         * STEP 3: Store in the in-memory ring buffer so that if this node
+         * Store in the in-memory ring buffer so that if this node
          * becomes leader, it can serve catchup to peers that are behind.
          * Without this, a newly elected leader has no changelogs to send.
+         *
+         * NOTE: We do NOT call changelog_mr() here. Writing changelogs
+         * to disk on a follower causes conflicts at restart because
+         * metadata.mfs.back may not be in sync with the changelogs.
+         * On restart, the follower will sync from the leader anyway.
          */
         changelog_store_entry(version, (const uint8_t *)changelog_line, len);
-
-        /*
-         * STEP 4: Write to the standard changelog files (changelog.0.mfs)
-         * so they survive restarts and can be used for disk-based catchup.
-         */
-        changelog_mr(version, changelog_line);
 
         /* Check if we can apply buffered changelogs (after catchup) */
         if (changelog_buffer_count > 0) {
@@ -957,10 +965,43 @@ static void on_sync_complete_cb(void) {
     matoclserv_disconnect_all();
 
     /*
-     * Step 2: Keep a rollback copy of the current metadata in case the
-     * reload fails.
+     * Step 2: Clean up ALL old metadata files from DATA_PATH.
+     * meta_loadall() scans for metadata* files and fails if it finds
+     * files with different metadata IDs.  The sync module placed the
+     * new metadata as metadata.mfs.back — remove everything else.
      */
-    rename(back_path, rollback_path);   /* Best-effort — ignore errors */
+    {
+        char rmpath[PATH_MAX];
+
+        /* Remove the current metadata.mfs (will be recreated from .back) */
+        snprintf(rmpath, sizeof(rmpath), "%s/metadata.mfs", dp);
+        unlink(rmpath);
+
+        /* Remove any pre_sync leftover (from the initial empty metadata) */
+        snprintf(rmpath, sizeof(rmpath), "%s/metadata.mfs.back.pre_sync", dp);
+        unlink(rmpath);
+
+        /* Remove old numbered backups that may have a different ID */
+        {
+            uint32_t n;
+            for (n = 1; n <= 10; n++) {
+                snprintf(rmpath, sizeof(rmpath), "%s/metadata.mfs.back.%"PRIu32, dp, n);
+                unlink(rmpath);
+            }
+        }
+
+        /* Remove changelogs — they belong to the old metadata version */
+        {
+            uint32_t n;
+            for (n = 0; n <= 50; n++) {
+                snprintf(rmpath, sizeof(rmpath), "%s/changelog.%"PRIu32".mfs", dp, n);
+                unlink(rmpath);
+            }
+        }
+
+        /* Keep a rollback copy of the old .back in case reload fails */
+        rename(back_path, rollback_path);
+    }
 
     /*
      * Step 3: Hot reload (cleanup → prepare → loadall).

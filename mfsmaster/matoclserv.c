@@ -1680,6 +1680,23 @@ void matoclserv_fuse_register(matoclserventry *eptr,const uint8_t *data,uint32_t
 	uint32_t sessionid;
 	uint8_t status;
 
+	/* HA: If this node is a follower, redirect client to the leader.
+	 * The client handles response size==4 as a redirect IP natively
+	 * (see mastercomm.c do { ... } while (i==4) loop). */
+	if (ha_is_follower()) {
+		uint32_t leader_ip = ha_get_leader_ip();
+		if (leader_ip != 0) {
+			mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+					"HA: Redirecting client %s to leader %u.%u.%u.%u",
+					eptr->strip,
+					(leader_ip >> 24) & 0xFF, (leader_ip >> 16) & 0xFF,
+					(leader_ip >> 8) & 0xFF, leader_ip & 0xFF);
+			wptr = matoclserv_create_packet(eptr, MATOCL_FUSE_REGISTER, 4);
+			put32bit(&wptr, leader_ip);
+			return;
+		}
+	}
+
 	if (length<64) {
 		mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CLTOMA_FUSE_REGISTER - wrong size (%"PRIu32"/<64)",length);
 		eptr->mode = KILL;

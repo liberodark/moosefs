@@ -84,7 +84,11 @@ typedef enum {
     HA_MSG_PING                 = 0x0030,   /* Simple ping */
     HA_MSG_PONG                 = 0x0031,   /* Ping response */
     HA_MSG_STATUS_REQUEST       = 0x0032,   /* Request peer status */
-    HA_MSG_STATUS_RESPONSE      = 0x0033    /* Status response */
+    HA_MSG_STATUS_RESPONSE      = 0x0033,   /* Status response */
+
+    /* Pre-vote (Raft extension - prevents term inflation from isolated nodes) */
+    HA_MSG_PRE_VOTE             = 0x0040,   /* Pre-vote request (does NOT increment term) */
+    HA_MSG_PRE_VOTE_RESPONSE    = 0x0041    /* Pre-vote response */
 } ha_msg_type_t;
 
 /* ============================================================================
@@ -117,21 +121,17 @@ typedef struct ha_peer {
     uint8_t     vote_granted;               /* Vote granted in current term */
     uint8_t     is_connected;               /* Connection status */
     char        hostname[256];              /* Hostname string */
-    /* Sync state for chunked transfer */
     char        sync_path[PATH_MAX];        /* Path to metadata file being synced */
     uint64_t    sync_filesize;              /* Size of file being synced */
     int         sync_fd;                    /* Open fd for metadata file (kept open during entire sync) */
     uint64_t    sync_version;               /* Metadata version read from the file header */
     uint32_t    sync_checksum;              /* CRC32 of the file being synced */
-    /* Changelog replication tracking (metalogger-style) */
     uint8_t     logstate;                   /* NONE=0, DELAYED=1, SYNC=2 */
     uint64_t    next_log_version;           /* Next changelog version to send (for DELAYED) */
     uint64_t    acked_version;              /* Last changelog version ACKed by this peer */
-    /* TCP receive reassembly (handles fragmentation and coalescing) */
     uint8_t     *recvbuf;                   /* Dynamically allocated receive buffer */
     uint32_t     recvbuf_len;               /* Valid bytes currently in recvbuf */
     uint32_t     recvbuf_cap;               /* Allocated capacity of recvbuf */
-    /* Non-blocking output queue (like matomlserv.c out_packetstruct) */
     ha_out_packet_t *outputhead;            /* First queued packet */
     ha_out_packet_t **outputtail;           /* Pointer to last ->next pointer */
 } ha_peer_t;
@@ -190,6 +190,10 @@ typedef struct ha_cluster {
     uint64_t    sync_target_version;        /* Target metadata version */
     uint8_t     sync_in_progress;           /* Sync operation in progress */
     uint64_t    votes_refused_version;      /* Highest meta_version seen in vote refusals this election */
+
+    /* Pre-vote (prevents term inflation from isolated nodes) */
+    uint8_t     pre_vote_in_progress;       /* Currently doing pre-vote round */
+    uint32_t    pre_votes_received;         /* Pre-votes granted this round */
 
     /* Statistics */
     uint64_t    elections_started;          /* Number of elections started */
@@ -297,7 +301,7 @@ int ha_request_leadership(void);
 
 /* Peer communication */
 uint32_t ha_get_self_id(void);
-uint32_t ha_get_leader_id(void);
+uint32_t ha_get_leader_peer_ip(void);  /* Actual IP of leader from peer list */
 int ha_send_to_leader(uint16_t type, const uint8_t *data, uint32_t len);
 int ha_send_to_peer(uint32_t peer_id, uint16_t type, const uint8_t *data, uint32_t len);
 int ha_request_catchup(uint64_t my_version);  /* Request changelog catchup from leader */

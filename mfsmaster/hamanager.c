@@ -74,6 +74,7 @@ static uint64_t log_buffer_count __attribute__((unused)) = 0;
 
 /* Forward declarations */
 static void ha_send_heartbeats(void);
+static void ha_become_candidate(void);
 static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_t len);
 static void ha_handle_sync_response(ha_peer_t *peer, const uint8_t *data, uint32_t len);
 static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, uint32_t len);
@@ -299,6 +300,82 @@ const char* ha_state_str(ha_state_t state) {
         case HA_STATE_SHUTDOWN:  return "SHUTDOWN";
         default:                 return "UNKNOWN";
     }
+}
+
+static char *HA_DataPath = NULL;
+
+/* ============================================================================
+ * Raft State Persistence
+ * ============================================================================ */
+
+/*
+ * Save current_term and voted_for to disk.
+ * Called whenever either value changes (Raft safety requirement).
+ * Without this, a restarted node could vote twice for the same term.
+ */
+static void ha_save_raft_state(void) {
+    char path[PATH_MAX];
+    char tmp_path[PATH_MAX];
+    FILE *f;
+
+    if (HA_DataPath == NULL) {
+        return;
+    }
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s/.ha_raft_state.tmp", HA_DataPath);
+    snprintf(path, sizeof(path), "%s/.ha_raft_state", HA_DataPath);
+
+    f = fopen(tmp_path, "w");
+    if (f == NULL) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Cannot save Raft state: %s", strerror(errno));
+        return;
+    }
+
+    fprintf(f, "TERM %"PRIu64"\nVOTED_FOR %"PRIu32"\n",
+            cluster->current_term, cluster->voted_for);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+
+    rename(tmp_path, path);
+}
+
+/*
+ * Load term and voted_for from disk on startup.
+ */
+static void ha_load_raft_state(void) {
+    char path[PATH_MAX];
+    FILE *f;
+    char key[32];
+    uint64_t val;
+
+    if (HA_DataPath == NULL) {
+        return;
+    }
+
+    snprintf(path, sizeof(path), "%s/.ha_raft_state", HA_DataPath);
+
+    f = fopen(path, "r");
+    if (f == NULL) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                "HA: No saved Raft state found (first start)");
+        return;
+    }
+
+    while (fscanf(f, "%31s %"PRIu64, key, &val) == 2) {
+        if (strcmp(key, "TERM") == 0) {
+            cluster->current_term = val;
+        } else if (strcmp(key, "VOTED_FOR") == 0) {
+            cluster->voted_for = (uint32_t)val;
+        }
+    }
+
+    fclose(f);
+
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA: Loaded Raft state: term=%"PRIu64", voted_for=%"PRIu32,
+            cluster->current_term, cluster->voted_for);
 }
 
 /* ============================================================================
@@ -556,6 +633,8 @@ static void ha_become_follower(uint64_t term, uint32_t leader_id) {
 
     pthread_mutex_unlock(&ha_mutex);
 
+    ha_save_raft_state();
+
     if (old_state != HA_STATE_FOLLOWER) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA: Became FOLLOWER in term %lu, leader is peer %u",
@@ -563,6 +642,130 @@ static void ha_become_follower(uint64_t term, uint32_t leader_id) {
 
         if (on_become_follower != NULL) {
             on_become_follower(leader_id);
+        }
+    }
+}
+
+/* ============================================================================
+ * Pre-Vote (Raft extension)
+ * Prevents term inflation from isolated nodes that keep trying elections.
+ * A pre-vote does NOT increment the term — it only checks if peers would
+ * grant a vote. Only if the pre-vote succeeds, we proceed to a real election.
+ * ============================================================================ */
+
+static void ha_start_pre_vote(void) {
+    uint8_t payload[sizeof(ha_request_vote_t)];
+    uint8_t *ptr = payload;
+    uint64_t my_meta_version;
+
+    my_meta_version = meta_version();
+
+    cluster->pre_vote_in_progress = 1;
+    cluster->pre_votes_received = 1;  /* Vote for self */
+    cluster->election_timeout = ha_random_timeout();
+    cluster->last_heartbeat_received = monotonic_seconds();
+
+    /* Build pre-vote: same format as RequestVote but with term+1 (not incremented) */
+    put64bit(&ptr, cluster->current_term + 1);
+    put32bit(&ptr, cluster->self_id);
+    put64bit(&ptr, cluster->last_log_index);
+    put64bit(&ptr, cluster->last_log_term);
+    put64bit(&ptr, my_meta_version);
+
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+            "HA: Starting pre-vote for term %lu (meta_version=%"PRIu64")",
+            cluster->current_term + 1, my_meta_version);
+
+    ha_broadcast_message(HA_MSG_PRE_VOTE, payload, sizeof(payload));
+}
+
+static void ha_handle_pre_vote(ha_peer_t *peer, const uint8_t *data, uint32_t len) {
+    uint8_t response[sizeof(ha_vote_response_t)];
+    uint8_t *ptr = response;
+    const uint8_t *rptr = data;
+    uint64_t term, last_log_index, last_log_term, candidate_meta_version;
+    uint64_t my_meta_version;
+    uint32_t candidate_id;
+    uint8_t vote_granted = 0;
+    double elapsed;
+
+    if (len < sizeof(ha_request_vote_t)) {
+        return;
+    }
+
+    term = get64bit(&rptr);
+    candidate_id = get32bit(&rptr);
+    last_log_index = get64bit(&rptr);
+    last_log_term = get64bit(&rptr);
+    candidate_meta_version = get64bit(&rptr);
+
+    my_meta_version = meta_version();
+
+    /* Pre-vote: grant only if:
+     * 1. Candidate's term >= our term
+     * 2. Candidate's log is up-to-date
+     * 3. Candidate's meta_version >= ours
+     * 4. We haven't heard from a leader recently (our own election timeout expired) */
+
+    elapsed = monotonic_seconds() - cluster->last_heartbeat_received;
+
+    if (term >= cluster->current_term &&
+        candidate_meta_version >= my_meta_version &&
+        (last_log_term > cluster->last_log_term ||
+         (last_log_term == cluster->last_log_term && last_log_index >= cluster->last_log_index)) &&
+        elapsed >= cluster->election_timeout) {
+        vote_granted = 1;
+    }
+
+    (void)candidate_id;
+
+    /* Build response — same format as vote response */
+    put64bit(&ptr, cluster->current_term);
+    put8bit(&ptr, vote_granted);
+    put32bit(&ptr, cluster->self_id);
+    put64bit(&ptr, vote_granted ? 0ULL : my_meta_version);
+
+    ha_send_message(peer, HA_MSG_PRE_VOTE_RESPONSE, response, sizeof(response));
+}
+
+static void ha_handle_pre_vote_response(ha_peer_t *peer, const uint8_t *data, uint32_t len) {
+    const uint8_t *rptr = data;
+    uint64_t term;
+    uint8_t vote_granted;
+    uint32_t voter_id;
+
+    (void)peer;
+
+    if (len < 13) {  /* term(8) + vote_granted(1) + voter_id(4) */
+        return;
+    }
+
+    term = get64bit(&rptr);
+    vote_granted = get8bit(&rptr);
+    voter_id = get32bit(&rptr);
+
+    if (!cluster->pre_vote_in_progress) {
+        return;
+    }
+
+    /* If their term is higher, we're stale — abort pre-vote */
+    if (term > cluster->current_term + 1) {
+        cluster->pre_vote_in_progress = 0;
+        return;
+    }
+
+    if (vote_granted) {
+        cluster->pre_votes_received++;
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_INFO,
+                "HA: Pre-vote granted by peer %u (%u/%u)",
+                voter_id, cluster->pre_votes_received, cluster->quorum_size);
+
+        if (cluster->pre_votes_received >= cluster->quorum_size) {
+            /* Pre-vote succeeded — proceed to real election */
+            cluster->pre_vote_in_progress = 0;
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                    "HA: Pre-vote succeeded, starting real election");
+            ha_become_candidate();
         }
     }
 }
@@ -594,6 +797,8 @@ static void ha_become_candidate(void) {
     put64bit(&ptr, my_meta_version);  /* Include metadata version */
 
     pthread_mutex_unlock(&ha_mutex);
+
+    ha_save_raft_state();
 
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA: Starting election for term %lu (meta_version=%"PRIu64")",
@@ -749,6 +954,10 @@ static void ha_handle_request_vote(ha_peer_t *peer, const uint8_t *data, uint32_
     put64bit(&ptr, vote_granted ? 0ULL : my_meta_version);  /* Include our version on refusal */
 
     pthread_mutex_unlock(&ha_mutex);
+
+    if (vote_granted) {
+        ha_save_raft_state();
+    }
 
     ha_send_message(peer, HA_MSG_VOTE_RESPONSE, response, sizeof(response));
 }
@@ -1147,6 +1356,12 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
         case HA_MSG_PONG:
             peer->last_heartbeat = monotonic_seconds();
             break;
+        case HA_MSG_PRE_VOTE:
+            ha_handle_pre_vote(peer, payload, payload_len);
+            break;
+        case HA_MSG_PRE_VOTE_RESPONSE:
+            ha_handle_pre_vote_response(peer, payload, payload_len);
+            break;
         default:
             mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
                     "HA: Unknown message type %u from peer %u",
@@ -1204,10 +1419,16 @@ static void ha_check_election_timeout(void) {
         /* Follower/Candidate: check for election timeout */
         elapsed = now - cluster->last_heartbeat_received;
         if (elapsed >= cluster->election_timeout) {
+            if (cluster->pre_vote_in_progress) {
+                /* Pre-vote timed out — reset and try again */
+                cluster->pre_vote_in_progress = 0;
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                        "HA: Pre-vote timed out, retrying");
+            }
             mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                    "HA: Election timeout (%.2fs elapsed, timeout=%.2fs), starting election",
+                    "HA: Election timeout (%.2fs elapsed, timeout=%.2fs), starting pre-vote",
                     elapsed, cluster->election_timeout);
-            ha_become_candidate();
+            ha_start_pre_vote();
         }
     } else {
         /* Log unexpected state */
@@ -1262,6 +1483,12 @@ int ha_init(void) {
     cluster->election_timeout = ha_random_timeout();  /* Must be after timeout_min/max init */
     cluster->enable_auto_failover = 1;
     cluster->last_heartbeat_received = monotonic_seconds();
+
+    /* Load DATA_PATH for state persistence */
+    HA_DataPath = cfg_getstr("DATA_PATH", "/var/lib/mfs");
+
+    /* Load persisted Raft state (term, voted_for) from disk */
+    ha_load_raft_state();
 
     mfs_log(MFSLOG_SYSLOG_STDERR, MFSLOG_INFO,
             "HA: Timeouts configured: heartbeat=%ums, election=%u-%ums",
@@ -1371,6 +1598,7 @@ void ha_term(void) {
     /* Free configuration strings */
     if (HA_BindHost) free(HA_BindHost);
     if (HA_PeerList) free(HA_PeerList);
+    if (HA_DataPath) free(HA_DataPath);
 
     /* Free cluster state */
     free(cluster);
@@ -1414,6 +1642,23 @@ uint32_t ha_get_leader_id(void) {
         return 0;
     }
     return cluster->leader_id;
+}
+
+/*
+ * Get the actual IP address of the current leader from the peer list.
+ * Returns IP in host byte order, or 0 if unknown.
+ */
+uint32_t ha_get_leader_peer_ip(void) {
+    uint32_t i;
+    if (cluster == NULL || cluster->leader_id == 0) {
+        return 0;
+    }
+    for (i = 0; i < cluster->peer_count; i++) {
+        if (cluster->peers[i].id == cluster->leader_id) {
+            return cluster->peers[i].ip;
+        }
+    }
+    return 0;
 }
 
 uint64_t ha_get_current_term(void) {
