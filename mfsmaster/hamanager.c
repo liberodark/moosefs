@@ -436,6 +436,7 @@ static void ha_disconnect_peer(ha_peer_t *peer) {
     }
     peer->outputhead = NULL;
     peer->outputtail = &(peer->outputhead);
+    peer->output_queue_bytes = 0;
 }
 
 /*
@@ -491,6 +492,9 @@ static void ha_ensure_leader_connection(void) {
     }
 }
 
+/* Maximum output queue per peer: 64 MB — disconnect if exceeded */
+#define HA_MAX_OUTPUT_QUEUE_BYTES (64 * 1024 * 1024)
+
 static int ha_send_message(ha_peer_t *peer, uint16_t type,
                            const uint8_t *payload, uint32_t payload_len) {
     ha_msg_header_t header;
@@ -502,6 +506,17 @@ static int ha_send_message(ha_peer_t *peer, uint16_t type,
         if (ha_connect_peer(peer) < 0) {
             return -1;
         }
+    }
+
+    /* Backpressure: if the output queue is too large, the peer is not
+     * reading fast enough — disconnect to avoid unbounded memory growth. */
+    total_len = sizeof(header) + payload_len;
+    if (peer->output_queue_bytes + total_len > HA_MAX_OUTPUT_QUEUE_BYTES) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Peer %u output queue exceeded %u MB - disconnecting slow peer",
+                peer->id, HA_MAX_OUTPUT_QUEUE_BYTES / (1024*1024));
+        ha_disconnect_peer(peer);
+        return -1;
     }
 
     /* Build header */
@@ -535,6 +550,7 @@ static int ha_send_message(ha_peer_t *peer, uint16_t type,
     /* Enqueue — will be sent from ha_serve() when socket is writable */
     *(peer->outputtail) = opack;
     peer->outputtail = &(opack->next);
+    peer->output_queue_bytes += total_len;
 
     return 0;
 }
@@ -565,6 +581,7 @@ static int ha_peer_flush_output(ha_peer_t *peer) {
         }
         opack->startptr += i;
         opack->bytesleft -= i;
+        peer->output_queue_bytes -= i;
         if (opack->bytesleft > 0) {
             return 0;  /* Partial send — continue next poll cycle */
         }
@@ -681,7 +698,10 @@ static void ha_start_pre_vote(void) {
     cluster->pre_vote_in_progress = 1;
     cluster->pre_votes_received = 1;  /* Vote for self */
     cluster->election_timeout = ha_random_timeout();
-    cluster->last_heartbeat_received = monotonic_seconds();
+    /* Use election_start to track pre-vote timing.
+     * Do NOT touch last_heartbeat_received — that's only for leader heartbeats
+     * and real votes. Touching it causes mutual blocking between pre-voting peers. */
+    cluster->election_start = monotonic_seconds();
 
     /* Build pre-vote: same format as RequestVote but with term+1 (not incremented) */
     put64bit(&ptr, cluster->current_term + 1);
@@ -1444,19 +1464,27 @@ static void ha_check_election_timeout(void) {
         }
     } else if (cluster->state == HA_STATE_FOLLOWER ||
                cluster->state == HA_STATE_CANDIDATE) {
-        /* Follower/Candidate: check for election timeout */
-        elapsed = now - cluster->last_heartbeat_received;
-        if (elapsed >= cluster->election_timeout) {
-            if (cluster->pre_vote_in_progress) {
-                /* Pre-vote timed out — reset and try again */
+        if (cluster->pre_vote_in_progress) {
+            /* Pre-vote in progress: check if it timed out using election_start,
+             * NOT last_heartbeat_received. This avoids mutual blocking when
+             * multiple peers are pre-voting simultaneously. */
+            elapsed = now - cluster->election_start;
+            if (elapsed >= cluster->election_timeout) {
                 cluster->pre_vote_in_progress = 0;
                 mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                         "HA: Pre-vote timed out, retrying");
+                ha_start_pre_vote();
             }
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                    "HA: Election timeout (%.2fs elapsed, timeout=%.2fs), starting pre-vote",
-                    elapsed, cluster->election_timeout);
-            ha_start_pre_vote();
+        } else {
+            /* No pre-vote in progress: check if we should start one.
+             * This uses last_heartbeat_received to detect a dead leader. */
+            elapsed = now - cluster->last_heartbeat_received;
+            if (elapsed >= cluster->election_timeout) {
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                        "HA: Election timeout (%.2fs elapsed, timeout=%.2fs), starting pre-vote",
+                        elapsed, cluster->election_timeout);
+                ha_start_pre_vote();
+            }
         }
     } else {
         /* Log unexpected state */

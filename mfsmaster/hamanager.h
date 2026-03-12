@@ -134,6 +134,7 @@ typedef struct ha_peer {
     uint32_t     recvbuf_cap;               /* Allocated capacity of recvbuf */
     ha_out_packet_t *outputhead;            /* First queued packet */
     ha_out_packet_t **outputtail;           /* Pointer to last ->next pointer */
+    uint64_t    output_queue_bytes;         /* Total bytes queued for output */
 } ha_peer_t;
 
 /* Peer log states (metalogger-style) */
