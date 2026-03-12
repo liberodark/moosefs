@@ -647,6 +647,7 @@ static void ha_become_follower(uint64_t term, uint32_t leader_id) {
     cluster->leader_id = leader_id;
     cluster->election_timeout = ha_random_timeout();
     cluster->last_heartbeat_received = monotonic_seconds();
+    cluster->pre_vote_in_progress = 0;  /* Cancel any in-progress pre-vote */
 
     pthread_mutex_unlock(&ha_mutex);
 
