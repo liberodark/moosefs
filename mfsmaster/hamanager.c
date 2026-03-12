@@ -657,6 +657,24 @@ static void ha_start_pre_vote(void) {
     uint8_t payload[sizeof(ha_request_vote_t)];
     uint8_t *ptr = payload;
     uint64_t my_meta_version;
+    uint32_t i, connected = 0;
+
+    /* Count connected peers */
+    for (i = 0; i < cluster->peer_count; i++) {
+        if (cluster->peers[i].is_connected) {
+            connected++;
+        }
+    }
+
+    /* If no peers are connected, skip pre-vote and go directly to candidate.
+     * Pre-vote is only useful when peers ARE reachable — it prevents disruption.
+     * With zero connected peers, pre-vote can never succeed and just wastes time. */
+    if (connected == 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA: No peers connected, skipping pre-vote, going direct to candidate");
+        ha_become_candidate();
+        return;
+    }
 
     my_meta_version = meta_version();
 

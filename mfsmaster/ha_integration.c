@@ -568,6 +568,13 @@ int ha_pre_metadata_sync(void) {
         return 0;
     }
 
+    /*
+     * HA mode always needs auto-restore enabled.
+     * Without it, meta_init() only looks for metadata.mfs (not .back)
+     * and fails if only a .back file exists (e.g. after sync or restart).
+     */
+    meta_allowautorestore();
+
     /* Get data path */
     data_path = cfg_getstr("DATA_PATH", "/var/lib/mfs");
 
