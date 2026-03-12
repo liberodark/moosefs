@@ -24,12 +24,12 @@
 # HA_BIND_HOST = *
 
 # Port for HA inter-master communication
-# Default: 9420
-# HA_PORT = 9420
+# Default: 9418
+# HA_PORT = 9418
 
 # Comma-separated list of peer master servers
 # Format: host1:port1,host2:port2,host3:port3
-# Example: master2.example.com:9420,master3.example.com:9420
+# Example: master2.example.com:9418,master3.example.com:9418
 # Note: Do not include the local server in this list
 # HA_PEERS = 
 
@@ -128,34 +128,34 @@
 # --------------------------
 # On master1.example.com (mfsha.cfg):
 #   HA_ENABLED = 1
-#   HA_PORT = 9420
-#   HA_PEERS = master2.example.com:9420,master3.example.com:9420
+#   HA_PORT = 9418
+#   HA_PEERS = master2.example.com:9418,master3.example.com:9418
 #
 # On master2.example.com (mfsha.cfg):
 #   HA_ENABLED = 1
-#   HA_PORT = 9420
-#   HA_PEERS = master1.example.com:9420,master3.example.com:9420
+#   HA_PORT = 9418
+#   HA_PEERS = master1.example.com:9418,master3.example.com:9418
 #
 # On master3.example.com (mfsha.cfg):
 #   HA_ENABLED = 1
-#   HA_PORT = 9420
-#   HA_PEERS = master1.example.com:9420,master2.example.com:9420
+#   HA_PORT = 9418
+#   HA_PEERS = master1.example.com:9418,master2.example.com:9418
 
 # Example: 2-node HA cluster with witness
 # ---------------------------------------
 # Note: 2-node clusters require a witness to avoid split-brain
 # On master1.example.com (mfsha.cfg):
 #   HA_ENABLED = 1
-#   HA_PORT = 9420
-#   HA_PEERS = master2.example.com:9420,witness.example.com:9420
+#   HA_PORT = 9418
+#   HA_PEERS = master2.example.com:9418,witness.example.com:9418
 #
 # On master2.example.com (mfsha.cfg):
 #   HA_ENABLED = 1
-#   HA_PORT = 9420
-#   HA_PEERS = master1.example.com:9420,witness.example.com:9420
+#   HA_PORT = 9418
+#   HA_PEERS = master1.example.com:9418,witness.example.com:9418
 #
 # On witness.example.com (runs mfsha-witness):
 #   HA_ENABLED = 1
-#   HA_PORT = 9420
-#   HA_PEERS = master1.example.com:9420,master2.example.com:9420
+#   HA_PORT = 9418
+#   HA_PEERS = master1.example.com:9418,master2.example.com:9418
 #   HA_WITNESS_MODE = 1

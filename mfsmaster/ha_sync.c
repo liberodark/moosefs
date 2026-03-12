@@ -61,66 +61,6 @@ static void handle_sync_chunk(const uint8_t *data, uint32_t len);
 static void handle_chunk_ack(uint32_t peer_id, const uint8_t *data, uint32_t len);
 
 /* ============================================================================
- * CRC64 Implementation (for checksumming metadata)
- * ============================================================================ */
-
-static const uint64_t crc64_table[256] = {
-    0x0000000000000000ULL, 0x42F0E1EBA9EA3693ULL, 0x85E1C3D753D46D26ULL,
-    0xC711223CFA3E5BB5ULL, 0x493366450E42ECDFULL, 0x0BC387AEA7A8DA4CULL,
-    0xCCD2A5925D9681F9ULL, 0x8E224479F47CB76AULL, 0x9266CC8A1C85D9BEULL,
-    0xD0962D61B56FEF2DULL, 0x17870F5D4F51B498ULL, 0x5577EEB6E6BB820BULL,
-    0xDB55AACF12C73561ULL, 0x99A54B24BB2D03F2ULL, 0x5EB4691841135847ULL,
-    0x1C4488F3E8F96ED4ULL, 0x663D78FF90E185EFULL, 0x24CD9914390BB37CULL,
-    0xE3DCBB28C335E8C9ULL, 0xA12C5AC36ADFDE5AULL, 0x2F0E1EBA9EA36930ULL,
-    0x6DFEFF5137495FA3ULL, 0xAAEFDD6DCD770416ULL, 0xE81F3C86649D3285ULL,
-    0xF45BB4758C645C51ULL, 0xB6AB559E258E6AC2ULL, 0x71BA77A2DFB03177ULL,
-    0x334A9649765A07E4ULL, 0xBD68D2308226B08EULL, 0xFF9833DB2BCC861DULL,
-    0x388911E7D1F2DDA8ULL, 0x7A79F00C7818EB3BULL, 0xCC7AF1FF21C30BDEULL,
-    0x8E8A101488293D4DULL, 0x499B3228721766F8ULL, 0x0B6BD3C3DBFD506BULL,
-    0x854997BA2F81E701ULL, 0xC7B975510C395CD2ULL, 0x00A8570374D4D067ULL,
-    0x4258B6B8D70E06F4ULL, 0x5E1C3D753D46D260ULL, 0x1CECDC9E94ACE4F3ULL,
-    0xDBFDFEA26E92BF46ULL, 0x990D1F49C77889D5ULL, 0x172F5B3033043EBFULL,
-    0x55DFBADB9AEE082CULL, 0x92CE98E760D05399ULL, 0xD03E790CC93A650AULL,
-    0xAA478900B1228E31ULL, 0xE8B768EB18C8B8A2ULL, 0x2FA64AD7E2F6E317ULL,
-    0x6D56AB3C4B1CD584ULL, 0xE374EF45BF6062EEULL, 0xA1840EAE168A547DULL,
-    0x66952C92ECB40FC8ULL, 0x2465CD79455E395BULL, 0x3821458AADA7578FULL,
-    0x7AD1A461044D611CULL, 0xBDC0865DFE733AA9ULL, 0xFF3067B657990C3AULL,
-    0x711223CFA3E5BB50ULL, 0x33E2C2158B904BC3ULL, 0xF4F3E018F031D676ULL,
-    0xB60301F359DBE0E5ULL, 0xDA050215EA6C212FULL, 0x98F5E3FE438617BCULL,
-    0x5FE4C1C2B9B84C09ULL, 0x1D14202910527A9AULL, 0x93366450E42ECDF0ULL,
-    0xD1C685BB4DC4FB63ULL, 0x16D7A787B7FAA0D6ULL, 0x5427466C1E109645ULL,
-    0x4863CE9FF6E9F891ULL, 0x0A932F745F03CE02ULL, 0xCD820D48A53D95B7ULL,
-    0x8F72ECA30CD7A324ULL, 0x0150A8DAF8AB144EULL, 0x43A04931514122DDULL,
-    0x84B16B0DAB7F7968ULL, 0xC6418AE602954FFBULL, 0xBC387AEA7A8DA4C0ULL,
-    0xFEC89B01D3679253ULL, 0x39D9B93D2959C9E6ULL, 0x7B2958D680B3FF75ULL,
-    0xF50B1CAF74CF481FULL, 0xB7FBFD44DD257E8CULL, 0x70EADF78271B2539ULL,
-    0x321A3E938EF113AAULL, 0x2E5EB66066087D7EULL, 0x6CAE578BCFE24BEDULL,
-    0xABBF75B735DC1058ULL, 0xE94F945C9C3626CBULL, 0x676DD025684A91A1ULL,
-    0x259D31CEC1A0A732ULL, 0xE28C13F23B9EFC87ULL, 0xA07CF2199274CA14ULL,
-    0x167FF3EACBAF2AF1ULL, 0x548F120162451C62ULL, 0x939E303D987B47D7ULL,
-    0xD16ED1D631917144ULL, 0x5F4C95AFC5EDC62EULL, 0x1DBC74446C07F0BDULL,
-    0xDAAD56789639AB08ULL, 0x985DB7933FD39D9BULL, 0x84193F60D72AF34FULL,
-    0xC6E9DE8B7EC0C5DCULL, 0x01F8FCB784FE9E69ULL, 0x43081D5C2D14A8FAULL,
-    0xCD2A5925D9681F90ULL, 0x8FDAB8CE70822903ULL, 0x48CB9AF28ABC72B6ULL,
-    0x0A3B7B1923564425ULL, 0x70428B155B4EAF1EULL, 0x32B26AFEF2A4998DULL,
-    0xF5A348C2089AC238ULL, 0xB753A929A170F4ABULL, 0x3971ED50550C43C1ULL,
-    0x7B810CBBFCE67552ULL, 0xBC902E8706D82EE7ULL, 0xFE60CF6CAF321874ULL,
-    0xE224479F47CB76A0ULL, 0xA0D4A674EE214033ULL, 0x67C58448141F1B86ULL,
-    0x256713B9D99B1515ULL, 0xAB451561BCC12C7FULL, 0xE9B5F48ACE2BACECULL,
-    0x2EA4D6D6C43A1259ULL, 0x6C54374A63DF24CAULL, 0xAC9DCE86CE7F5AFEULL,
-    0xEE6D2F6DC6DE8A6DULL, 0x297C0DE045825F8ULL,  0x6B8C6DE06B8C6DE0ULL,
-    /* ... more entries - abbreviated for space */
-};
-
-static uint64_t crc64_update(uint64_t crc, const uint8_t *data, size_t len) {
-    size_t i;
-    for (i = 0; i < len; i++) {
-        crc = crc64_table[(uint8_t)(crc ^ data[i])] ^ (crc >> 8);
-    }
-    return crc;
-}
-
-/* ============================================================================
  * Helper Functions
  * ============================================================================ */
 
@@ -144,12 +84,12 @@ static void get_temp_sync_path(char *buf, size_t buflen) {
 }
 
 /* ============================================================================
- * Checksum Functions
+ * Checksum Functions — uses MooseFS mycrc32() from crc.c
  * ============================================================================ */
 
 uint64_t ha_sync_calculate_checksum(const char *path) {
     int fd;
-    uint64_t crc = 0xFFFFFFFFFFFFFFFFULL;
+    uint32_t crc = 0;
     uint8_t buf[65536];
     ssize_t n;
 
@@ -159,11 +99,11 @@ uint64_t ha_sync_calculate_checksum(const char *path) {
     }
 
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
-        crc = crc64_update(crc, buf, n);
+        crc = mycrc32(crc, buf, n);
     }
 
     close(fd);
-    return crc ^ 0xFFFFFFFFFFFFFFFFULL;
+    return (uint64_t)crc;
 }
 
 /* ============================================================================
@@ -499,8 +439,8 @@ static void ha_sync_finalize(void) {
 
     if (sync_ctx.target_checksum != 0 && checksum != sync_ctx.target_checksum) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA Sync: Final checksum mismatch (got %016lx, expected %016lx)",
-                checksum, sync_ctx.target_checksum);
+                "HA Sync: Final checksum mismatch (got 0x%08X, expected 0x%08X)",
+                (uint32_t)checksum, (uint32_t)sync_ctx.target_checksum);
         unlink(sync_ctx.temp_path);
         sync_ctx.state = HA_SYNC_STATE_FAILED;
         pthread_mutex_unlock(&sync_mutex);
@@ -509,11 +449,12 @@ static void ha_sync_finalize(void) {
 
     if (sync_ctx.target_checksum == 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                "HA Sync: Transfer complete (checksum=%016lx), installing metadata",
-                checksum);
+                "HA Sync: Transfer complete (crc32=0x%08X), installing metadata",
+                (uint32_t)checksum);
     } else {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                "HA Sync: Checksum verified, installing new metadata");
+                "HA Sync: Checksum verified (crc32=0x%08X), installing new metadata",
+                (uint32_t)checksum);
     }
 
     /* Backup current metadata.mfs.back (what MooseFS loads at startup) */
@@ -820,27 +761,33 @@ void ha_sync_handle_message(uint32_t peer_id, uint8_t msg_type,
             break;
 
         case HA_MSG_SYNC_INFO:
-            /* Sync info from leader: version(8) + filesize(8) */
+            /* Sync info from leader: version(8) + filesize(8) + crc32(4) */
             if (len >= 16) {
                 const uint8_t *ptr = data;
                 uint64_t leader_version = get64bit(&ptr);
                 uint64_t file_size = get64bit(&ptr);
+                uint32_t leader_crc = 0;
                 uint32_t chunk_count;
                 uint8_t chunk_req[12];
                 uint8_t *wptr;
+
+                /* CRC32 is present in the new protocol (20 bytes) */
+                if (len >= 20) {
+                    leader_crc = get32bit(&ptr);
+                }
 
                 chunk_count = (file_size + HA_SYNC_CHUNK_SIZE - 1) / HA_SYNC_CHUNK_SIZE;
                 if (chunk_count == 0) chunk_count = 1;
 
                 mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                        "HA Sync: Received sync info: version=%"PRIu64", size=%"PRIu64", chunks=%u",
-                        leader_version, file_size, chunk_count);
+                        "HA Sync: Received sync info: version=%"PRIu64", size=%"PRIu64", chunks=%u, crc32=0x%08X",
+                        leader_version, file_size, chunk_count, leader_crc);
 
                 pthread_mutex_lock(&sync_mutex);
 
                 /* Prepare to receive chunks */
                 sync_ctx.target_version = leader_version;
-                sync_ctx.target_checksum = 0;  /* No checksum in this protocol */
+                sync_ctx.target_checksum = (uint64_t)leader_crc;
                 sync_ctx.file_size = file_size;
                 sync_ctx.total_chunks = chunk_count;
                 sync_ctx.received_chunks = 0;

@@ -44,6 +44,7 @@
 #include "metadata.h"
 #include "changelog.h"
 #include "crc.h"
+#include "MFSCommunication.h"
 
 /* ============================================================================
  * Internal State
@@ -351,6 +352,10 @@ static void ha_disconnect_peer(ha_peer_t *peer) {
     if (peer->sock >= 0) {
         tcpclose(peer->sock);
         peer->sock = -1;
+    }
+    if (peer->sync_fd >= 0) {
+        close(peer->sync_fd);
+        peer->sync_fd = -1;
     }
     peer->is_connected = 0;
     /* Reset the receive reassembly buffer but keep the allocation */
@@ -1451,6 +1456,7 @@ int ha_add_peer(const char *host, uint16_t port) {
     peer->logstate = HA_LOGSTATE_NONE;  /* Will be set when peer registers */
     peer->next_log_version = 0;
     peer->acked_version = 0;
+    peer->sync_fd = -1;
     peer->recvbuf = NULL;
     peer->recvbuf_len = 0;
     peer->recvbuf_cap = 0;
@@ -1561,7 +1567,11 @@ int ha_request_sync(void) {
 
 /*
  * Handle sync request from a follower (leader side)
- * Now sends SYNC_INFO with file size, follower will request chunks
+ *
+ * Opens the metadata file ONCE and keeps the fd in peer->sync_fd.
+ * This guarantees consistency even if bgsaver rotates the file
+ * during the transfer (POSIX: open fd survives rename/unlink).
+ * The version is read from the file header, not from meta_version().
  */
 static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_t len) {
     const uint8_t *rptr = data;
@@ -1572,7 +1582,10 @@ static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_
     struct stat st;
     uint8_t response[24];
     uint8_t *ptr;
-    uint64_t my_version;
+    uint8_t hdr[24];
+    ssize_t nr;
+    uint64_t file_version;
+    uint32_t file_crc;
 
     if (len < 16) {
         return;
@@ -1580,14 +1593,7 @@ static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_
 
     follower_version = get64bit(&rptr);
     follower_checksum = get64bit(&rptr);
-    (void)follower_checksum;  /* May use later for incremental sync */
-
-    extern uint64_t meta_version(void);
-    my_version = meta_version();
-
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA: Received sync request from peer %u (their version=%"PRIu64", my version=%"PRIu64")",
-            peer->id, follower_version, my_version);
+    (void)follower_checksum;
 
     if (cluster->state != HA_STATE_LEADER) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
@@ -1595,14 +1601,18 @@ static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_
         return;
     }
 
-    /* Get data path from config */
+    /* Close any previous sync fd for this peer */
+    if (peer->sync_fd >= 0) {
+        close(peer->sync_fd);
+        peer->sync_fd = -1;
+    }
+
+    /* Find metadata file */
     data_path = cfg_getstr("DATA_PATH", "/var/lib/mfs");
     snprintf(metadata_path, sizeof(metadata_path), "%s/metadata.mfs.back", data_path);
     free(data_path);
 
-    /* Check if metadata file exists */
     if (stat(metadata_path, &st) < 0) {
-        /* Try without .back */
         data_path = cfg_getstr("DATA_PATH", "/var/lib/mfs");
         snprintf(metadata_path, sizeof(metadata_path), "%s/metadata.mfs", data_path);
         free(data_path);
@@ -1613,25 +1623,78 @@ static void ha_handle_sync_request(ha_peer_t *peer, const uint8_t *data, uint32_
         }
     }
 
-    /* Store path for chunk requests */
+    /* Open the file and KEEP the fd for the entire sync duration.
+     * Even if bgsaver does rename() on the file, this fd still points
+     * to the original inode — guaranteed by POSIX. */
+    peer->sync_fd = open(metadata_path, O_RDONLY);
+    if (peer->sync_fd < 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA: Cannot open metadata file for sync: %s", strerror(errno));
+        return;
+    }
+
+    /* Re-stat through the fd to get exact size of the opened file */
+    if (fstat(peer->sync_fd, &st) < 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
+                "HA: Cannot fstat metadata file: %s", strerror(errno));
+        close(peer->sync_fd);
+        peer->sync_fd = -1;
+        return;
+    }
+
     snprintf(peer->sync_path, sizeof(peer->sync_path), "%s", metadata_path);
     peer->sync_filesize = st.st_size;
 
+    /* Read version from the file header (not from meta_version() which is ahead).
+     * Format 2.0: bytes 0-7 = signature "MFSM 2.0", bytes 8-15 = metaversion */
+    file_version = 0;
+    nr = pread(peer->sync_fd, hdr, 24, 0);
+    if (nr >= 16 && memcmp(hdr, MFSSIGNATURE "M ", 5) == 0 &&
+        hdr[5] >= '1' && hdr[5] <= '9' && hdr[6] == '.' && hdr[7] >= '0' && hdr[7] <= '9') {
+        uint8_t fver = ((hdr[5] - '0') << 4) + (hdr[7] - '0');
+        if (fver >= 0x20 && nr >= 16) {
+            const uint8_t *vptr = hdr + 8;
+            file_version = get64bit(&vptr);
+        }
+    }
+
+    if (file_version == 0) {
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                "HA: Could not read version from metadata file header, using meta_version()");
+        file_version = meta_version();
+    }
+
+    /* Compute CRC32 of the entire file (using the open fd) */
+    {
+        uint8_t buf[65536];
+        ssize_t n;
+        file_crc = 0;
+        lseek(peer->sync_fd, 0, SEEK_SET);
+        while ((n = read(peer->sync_fd, buf, sizeof(buf))) > 0) {
+            file_crc = mycrc32(file_crc, buf, n);
+        }
+    }
+
+    peer->sync_version = file_version;
+    peer->sync_checksum = file_crc;
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA: Sending sync info for %s (size=%"PRIu64") to peer %u",
-            metadata_path, (uint64_t)st.st_size, peer->id);
+            "HA: Sync for peer %u: file=%s, size=%"PRIu64", file_version=%"PRIu64", crc32=0x%08X (follower_version=%"PRIu64")",
+            peer->id, metadata_path, (uint64_t)st.st_size, file_version, file_crc, follower_version);
 
-    /* Send SYNC_INFO: version(8) + filesize(8) */
+    /* Send SYNC_INFO: file_version(8) + filesize(8) + crc32(4) */
     ptr = response;
-    put64bit(&ptr, my_version);
+    put64bit(&ptr, file_version);
     put64bit(&ptr, (uint64_t)st.st_size);
+    put32bit(&ptr, file_crc);
 
-    ha_send_message(peer, HA_MSG_SYNC_INFO, response, 16);
+    ha_send_message(peer, HA_MSG_SYNC_INFO, response, 20);
 }
 
 /*
  * Handle chunk request from follower (leader side)
- * Sends chunk with CRC like metalogger does
+ * Reads from the persistent sync_fd (opened in ha_handle_sync_request).
+ * Uses pread() so no seeking state is shared between calls.
  */
 static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, uint32_t len) {
     const uint8_t *rptr = data;
@@ -1639,7 +1702,6 @@ static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, u
     uint32_t size;
     uint8_t *response;
     uint8_t *ptr;
-    int fd;
     ssize_t bytes_read;
     uint32_t crc;
 
@@ -1658,9 +1720,9 @@ static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, u
         return;
     }
 
-    if (peer->sync_path[0] == '\0') {
+    if (peer->sync_fd < 0) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                "HA: Chunk request without prior sync request");
+                "HA: Chunk request without active sync (sync_fd not open)");
         return;
     }
 
@@ -1680,34 +1742,18 @@ static void ha_handle_sync_chunk_request(ha_peer_t *peer, const uint8_t *data, u
         return;
     }
 
-    /* Read chunk from file */
-    fd = open(peer->sync_path, O_RDONLY);
-    if (fd < 0) {
-        free(response);
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA: Cannot open metadata file for chunk: %s", strerror(errno));
-        return;
-    }
-
-    if (lseek(fd, offset, SEEK_SET) < 0) {
-        close(fd);
-        free(response);
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA: Cannot seek in metadata file");
-        return;
-    }
-
-    bytes_read = read(fd, response + 16, size);
-    close(fd);
+    /* Read chunk from the persistent fd using pread (no seek state) */
+    bytes_read = pread(peer->sync_fd, response + 16, size, offset);
 
     if (bytes_read != (ssize_t)size) {
         free(response);
         mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA: Failed to read chunk from metadata file");
+                "HA: Failed to read chunk from metadata file (got %zd, expected %u)",
+                bytes_read, size);
         return;
     }
 
-    /* Calculate CRC */
+    /* Calculate CRC32 */
     crc = mycrc32(0, response + 16, size);
 
     /* Build response header */

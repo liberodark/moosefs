@@ -449,29 +449,22 @@ static int download_metadata_from_peer(uint32_t ip, uint16_t port, const char *d
             continue;
         }
 
-        /* fsync after each chunk (like metalogger) */
-        if (fsync(fd) < 0) {
-            free(payload);
-            payload = NULL;
-            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-                    "HA Pre-sync: fsync failed");
-            if (++retry_count >= 5) {
-                goto cleanup;
-            }
-            continue;
-        }
-
         free(payload);
         payload = NULL;
 
         offset += chunk_size;
         retry_count = 0;  /* Reset retry counter on success */
 
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                "HA Pre-sync: Downloaded %"PRIu64"/%"PRIu64" bytes (%.1f%%)",
-                offset, file_size, (100.0 * offset) / file_size);
+        /* Log progress every 10% */
+        if ((offset * 10 / file_size) > ((offset - chunk_size) * 10 / file_size)) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                    "HA Pre-sync: Downloaded %"PRIu64"/%"PRIu64" bytes (%.1f%%)",
+                    offset, file_size, (100.0 * offset) / file_size);
+        }
     }
 
+    /* Single fsync after all chunks are written */
+    fsync(fd);
     close(fd);
     fd = -1;
     tcpclose(sock);

@@ -31,7 +31,7 @@
  * ============================================================================ */
 
 #define HA_MAX_PEERS            16          /* Maximum number of masters in cluster */
-#define HA_DEFAULT_PORT         9420        /* Default HA communication port */
+#define HA_DEFAULT_PORT         9418        /* Default HA communication port */
 #define HA_HEARTBEAT_MS         150         /* Heartbeat interval in milliseconds */
 #define HA_ELECTION_TIMEOUT_MIN 1500        /* Minimum election timeout (ms) */
 #define HA_ELECTION_TIMEOUT_MAX 3000        /* Maximum election timeout (ms) */
@@ -112,6 +112,9 @@ typedef struct ha_peer {
     /* Sync state for chunked transfer */
     char        sync_path[PATH_MAX];        /* Path to metadata file being synced */
     uint64_t    sync_filesize;              /* Size of file being synced */
+    int         sync_fd;                    /* Open fd for metadata file (kept open during entire sync) */
+    uint64_t    sync_version;               /* Metadata version read from the file header */
+    uint32_t    sync_checksum;              /* CRC32 of the file being synced */
     /* Changelog replication tracking (metalogger-style) */
     uint8_t     logstate;                   /* NONE=0, DELAYED=1, SYNC=2 */
     uint64_t    next_log_version;           /* Next changelog version to send (for DELAYED) */

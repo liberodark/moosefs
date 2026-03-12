@@ -61,7 +61,7 @@ typedef enum {
 /* Sync request payload */
 typedef struct {
     uint64_t    version;            /* Current metadata version */
-    uint64_t    checksum;           /* Metadata checksum (CRC64) */
+    uint64_t    checksum;           /* Metadata checksum (CRC32 stored as uint64) */
     uint32_t    peer_id;            /* Requesting peer ID */
     uint32_t    flags;              /* Request flags */
 } __attribute__((packed)) ha_sync_request_t;
