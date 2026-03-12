@@ -61,7 +61,7 @@ static uint64_t changelog_buffer_count = 0;
 static char *data_path_cache = NULL;
 
 /* Changelog buffer for when sync is in progress */
-#define CHANGELOG_BUFFER_SIZE 1000
+#define CHANGELOG_BUFFER_SIZE 100000
 typedef struct {
     uint64_t version;
     uint8_t *data;
@@ -620,11 +620,30 @@ int ha_pre_metadata_sync(void) {
         }
     }
 
-    /* Not fatal — this node may be the first in the cluster, or all peers
-     * are down.  Let meta_init() handle it: it will create empty metadata
-     * with -e, or load from disk with -a, or fail with a clear message. */
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
-            "HA Pre-sync: Could not sync metadata from any peer - continuing (use -e for empty start or -a for auto-restore)");
+    /* Not fatal — create an empty metadata so meta_init() can start.
+     * This node will either become leader (if first in cluster) or
+     * sync from the real leader once the election completes.
+     * The empty metadata is safe because:
+     * - If we become leader with empty data, we're the first node
+     * - If another node becomes leader, HA replication overwrites our state */
+    {
+        char metapath[PATH_MAX];
+        int mfd;
+        snprintf(metapath, sizeof(metapath), "%s/metadata.mfs", data_path);
+        mfd = open(metapath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (mfd >= 0) {
+            /* Write "MFSM NEW" header — same as metadata.mfs.empty */
+            write(mfd, "MFSM NEW", 8);
+            close(mfd);
+            /* Enable auto-restore so meta_init() accepts the empty file */
+            meta_allowautorestore();
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                    "HA Pre-sync: Created empty metadata.mfs - will sync from leader after election");
+        } else {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                    "HA Pre-sync: Could not create empty metadata.mfs: %s", strerror(errno));
+        }
+    }
     result = 0;
 
 cleanup:
@@ -1080,10 +1099,9 @@ int ha_should_replicate(void) {
     if (!ha_enabled) {
         mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
                 "HA: ha_should_replicate: HA not enabled");
-        return 0;  /* No HA, no replication */
+        return 0;
     }
 
-    /* Only replicate if we're the leader */
     is_leader = ha_is_leader();
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA: ha_should_replicate: ha_enabled=%d, is_leader=%d",
@@ -1098,7 +1116,7 @@ int ha_should_replicate(void) {
  */
 int ha_is_follower(void) {
     if (!ha_enabled) {
-        return 0;  /* No HA, not a follower */
+        return 0;
     }
     return !ha_is_leader();
 }
@@ -1120,12 +1138,9 @@ void ha_metadata_version_changed(uint64_t version) {
         return;
     }
 
-    /* Log version change */
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
             "HA Integration: Metadata version changed to %lu", version);
 
-    /* If we're the leader, this is normal after applying our own changes */
-    /* If we're a follower, this should only happen when applying replicated changes */
     if (!ha_is_leader()) {
         /* Follower received and applied a change - good */
     }

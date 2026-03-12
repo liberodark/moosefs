@@ -1181,6 +1181,24 @@ static void ha_check_election_timeout(void) {
         if (elapsed >= (double)cluster->heartbeat_interval_ms / 1000.0) {
             ha_send_heartbeats();
         }
+
+        /* Leader: check quorum — step down if we lost majority of peers.
+         * This prevents split-brain: an isolated leader stops accepting writes. */
+        {
+            uint32_t connected = 0;
+            uint32_t j;
+            for (j = 0; j < cluster->peer_count; j++) {
+                if (cluster->peers[j].is_connected) {
+                    connected++;
+                }
+            }
+            if (connected + 1 < cluster->quorum_size) {
+                mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+                        "HA: Lost quorum (%u connected + self = %u, need %u) - stepping down",
+                        connected, connected + 1, cluster->quorum_size);
+                ha_become_follower(cluster->current_term, 0);
+            }
+        }
     } else if (cluster->state == HA_STATE_FOLLOWER ||
                cluster->state == HA_STATE_CANDIDATE) {
         /* Follower/Candidate: check for election timeout */
