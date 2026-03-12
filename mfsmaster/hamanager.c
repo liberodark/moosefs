@@ -1284,25 +1284,19 @@ static void ha_handle_message(ha_peer_t *peer, const uint8_t *data, uint32_t len
             ha_handle_changelog_entry(peer, payload, payload_len);
             break;
         case HA_MSG_CHANGELOG_ACK:
-            /* ACK received from follower - track version (metalogger-style) */
+            /* ACK received from follower - just track the version.
+             * Do NOT downgrade SYNC→DELAYED here: the batch catchup in
+             * ha_catchup_peer() manages the DELAYED→SYNC transition
+             * correctly.  Downgrading based on acked_version causes a
+             * ping-pong loop because ACKs arrive asynchronously after
+             * the batch was already sent. */
             if (payload_len >= 8) {
                 const uint8_t *ack_ptr = payload;
                 uint64_t acked_version = get64bit(&ack_ptr);
-                uint64_t current_version = meta_version();
 
                 /* Update peer's acked version */
                 if (acked_version > peer->acked_version) {
                     peer->acked_version = acked_version;
-                }
-
-                /* If peer is significantly behind, switch to DELAYED for catchup */
-                if (peer->logstate == HA_LOGSTATE_SYNC &&
-                    current_version > acked_version + 100) {
-                    mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-                            "HA: Peer %u fell behind (acked %"PRIu64", current %"PRIu64") - switching to DELAYED",
-                            peer->id, acked_version, current_version);
-                    peer->logstate = HA_LOGSTATE_DELAYED;
-                    peer->next_log_version = acked_version + 1;
                 }
             }
             break;
