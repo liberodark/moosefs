@@ -582,16 +582,29 @@ int ha_pre_metadata_sync(void) {
         return 0;
     }
 
+    /* Check if this is a first-time init (metadata.mfs.empty present). */
+    {
+        char emptypath[PATH_MAX];
+        struct stat est;
+        snprintf(emptypath, sizeof(emptypath), "%s/metadata.mfs.empty", data_path);
+        if (stat(emptypath, &est) == 0) {
+            mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                    "HA Pre-sync: Found metadata.mfs.empty - first-time init, skipping peer sync");
+            free(data_path);
+            return 0;
+        }
+    }
+
     mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
-            "HA Pre-sync: No metadata found, will sync from peers");
+            "HA Pre-sync: No metadata found, will try to sync from peers");
 
     /* Get peers from config */
     peers_str = cfg_getstr("HA_PEERS", NULL);
     if (!peers_str || !peers_str[0]) {
-        mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-                "HA Pre-sync: No peers configured (HA_PEERS)");
+        mfs_log(MFSLOG_SYSLOG, MFSLOG_NOTICE,
+                "HA Pre-sync: No peers configured - continuing without sync (first node in cluster?)");
         free(data_path);
-        return -1;
+        return 0;
     }
 
     /* Try to sync from peers with retries */
@@ -610,9 +623,12 @@ int ha_pre_metadata_sync(void) {
         }
     }
 
-    mfs_log(MFSLOG_SYSLOG, MFSLOG_ERR,
-            "HA Pre-sync: Failed to sync metadata from any peer after 5 retries");
-    result = -1;
+    /* Not fatal — this node may be the first in the cluster, or all peers
+     * are down.  Let meta_init() handle it: it will create empty metadata
+     * with -e, or load from disk with -a, or fail with a clear message. */
+    mfs_log(MFSLOG_SYSLOG, MFSLOG_WARNING,
+            "HA Pre-sync: Could not sync metadata from any peer - continuing (use -e for empty start or -a for auto-restore)");
+    result = 0;
 
 cleanup:
     free(data_path);

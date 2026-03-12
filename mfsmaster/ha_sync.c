@@ -423,7 +423,7 @@ static void handle_sync_chunk(const uint8_t *data, uint32_t len) {
 
 static void ha_sync_finalize(void) {
     char metadata_path[PATH_MAX];
-    char backup_path[PATH_MAX];
+    char backup_path[PATH_MAX + 16];
     uint64_t checksum;
 
     pthread_mutex_lock(&sync_mutex);

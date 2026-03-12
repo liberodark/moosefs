@@ -59,8 +59,6 @@ static ha_on_become_leader_fn on_become_leader = NULL;
 static ha_on_become_follower_fn on_become_follower = NULL;
 static ha_on_changelog_received_fn on_changelog_received = NULL;
 static ha_on_sync_complete_fn on_sync_complete = NULL;
-static ha_on_sync_data_fn sync_info_callback = NULL;
-
 /* Configuration */
 static char *HA_PeerList = NULL;
 static char *HA_BindHost = NULL;
